@@ -1,0 +1,313 @@
+import json
+import re as stdlib_re
+from base64 import b64encode
+
+import aiohttp
+import pytest
+import yarl
+from aioresponses import aioresponses
+
+from mcp.server.fastmcp.exceptions import ToolError
+
+import main
+
+JIRA_BASE = "https://openmrs.atlassian.net"
+
+
+@pytest.fixture(autouse=True)
+def _jira_env(monkeypatch):
+    monkeypatch.setenv("JIRA_EMAIL", "test@example.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "fake-token")
+
+
+@pytest.fixture(autouse=True)
+async def _reset_session():
+    """Ensure each test starts with a fresh session."""
+    main._session = None
+    yield
+    if main._session and not main._session.closed:
+        await main._session.close()
+    main._session = None
+
+
+# ---------------------------------------------------------------------------
+# _get_session / session reuse
+# ---------------------------------------------------------------------------
+
+
+async def test_get_session_creates_session():
+    session = main._get_session()
+    assert isinstance(session, aiohttp.ClientSession)
+
+
+async def test_get_session_reuses_session():
+    s1 = main._get_session()
+    s2 = main._get_session()
+    assert s1 is s2
+
+
+# ---------------------------------------------------------------------------
+# _request
+# ---------------------------------------------------------------------------
+
+
+async def test_request_sends_auth_header():
+    expected_cred = b64encode(b"test@example.com:fake-token").decode()
+    with aioresponses() as m:
+        m.get(f"{JIRA_BASE}/rest/api/3/test", payload={"ok": True})
+        status, body = await main._request("GET", "/rest/api/3/test")
+
+    assert status == 200
+    assert body == {"ok": True}
+    call = m.requests[("GET", yarl.URL(f"{JIRA_BASE}/rest/api/3/test"))][0]
+    assert call.kwargs["headers"]["Authorization"] == f"Basic {expected_cred}"
+
+
+async def test_request_returns_text_for_non_json():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/test",
+            body="plain text",
+            content_type="text/plain",
+        )
+        status, body = await main._request("GET", "/rest/api/3/test")
+
+    assert status == 200
+    assert body == "plain text"
+
+
+# ---------------------------------------------------------------------------
+# _error_message
+# ---------------------------------------------------------------------------
+
+
+def test_error_message_with_string_body():
+    msg = main._error_message(500, "Server error")
+    assert msg == "Jira error (HTTP 500): Server error"
+
+
+def test_error_message_with_error_messages():
+    body = {"errorMessages": ["Issue not found", "Permission denied"]}
+    msg = main._error_message(404, body)
+    assert "Issue not found" in msg
+    assert "Permission denied" in msg
+
+
+def test_error_message_with_field_errors():
+    body = {"errors": {"summary": "Field is required"}}
+    msg = main._error_message(400, body)
+    assert "summary: Field is required" in msg
+
+
+def test_error_message_fallback_to_json():
+    body = {"unexpected": "structure"}
+    msg = main._error_message(400, body)
+    assert json.dumps(body) in msg
+
+
+# ---------------------------------------------------------------------------
+# _markdown_to_adf
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_to_adf_plain_paragraph():
+    result = main._markdown_to_adf("Hello world")
+    assert result["type"] == "doc"
+    assert result["version"] == 1
+    assert len(result["content"]) == 1
+    para = result["content"][0]
+    assert para["type"] == "paragraph"
+    assert para["content"][0]["text"] == "Hello world"
+
+
+def test_markdown_to_adf_heading():
+    result = main._markdown_to_adf("## Section Title")
+    heading = result["content"][0]
+    assert heading["type"] == "heading"
+    assert heading["attrs"]["level"] == 2
+    assert heading["content"][0]["text"] == "Section Title"
+
+
+def test_markdown_to_adf_bullet_list():
+    md = "- item one\n- item two"
+    result = main._markdown_to_adf(md)
+    bl = result["content"][0]
+    assert bl["type"] == "bulletList"
+    assert len(bl["content"]) == 2
+
+
+def test_markdown_to_adf_ordered_list():
+    md = "1. first\n2. second\n3. third"
+    result = main._markdown_to_adf(md)
+    ol = result["content"][0]
+    assert ol["type"] == "orderedList"
+    assert len(ol["content"]) == 3
+
+
+def test_markdown_to_adf_code_block():
+    md = "```python\nprint('hi')\n```"
+    result = main._markdown_to_adf(md)
+    cb = result["content"][0]
+    assert cb["type"] == "codeBlock"
+    assert cb["attrs"]["language"] == "python"
+    assert cb["content"][0]["text"] == "print('hi')"
+
+
+def test_markdown_to_adf_inline_bold():
+    result = main._markdown_to_adf("some **bold** text")
+    nodes = result["content"][0]["content"]
+    assert nodes[0]["text"] == "some "
+    assert nodes[1]["text"] == "bold"
+    assert nodes[1]["marks"] == [{"type": "strong"}]
+
+
+def test_markdown_to_adf_inline_code():
+    result = main._markdown_to_adf("use `foo()` here")
+    nodes = result["content"][0]["content"]
+    assert nodes[1]["text"] == "foo()"
+    assert nodes[1]["marks"] == [{"type": "code"}]
+
+
+def test_markdown_to_adf_link():
+    result = main._markdown_to_adf("see [OpenMRS](https://openmrs.org)")
+    nodes = result["content"][0]["content"]
+    link_node = nodes[1]
+    assert link_node["text"] == "OpenMRS"
+    assert link_node["marks"][0]["type"] == "link"
+    assert link_node["marks"][0]["attrs"]["href"] == "https://openmrs.org"
+
+
+# ---------------------------------------------------------------------------
+# createJiraIssue
+# ---------------------------------------------------------------------------
+
+
+async def test_create_issue_minimal():
+    with aioresponses() as m:
+        m.post(
+            f"{JIRA_BASE}/rest/api/3/issue",
+            payload={"id": "10001", "key": "TEST-1", "self": "..."},
+        )
+        result = await main.createJiraIssue(
+            projectKey="TEST",
+            summary="A test issue",
+            issueType="Bug",
+        )
+
+    assert "Created TEST-1" in result
+    assert f"{JIRA_BASE}/browse/TEST-1" in result
+
+    call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue"))][0]
+    sent = call.kwargs["json"]
+    assert sent["fields"]["project"] == {"key": "TEST"}
+    assert sent["fields"]["summary"] == "A test issue"
+    assert sent["fields"]["issuetype"] == {"name": "Bug"}
+    assert "description" not in sent["fields"]
+    assert "priority" not in sent["fields"]
+    assert "labels" not in sent["fields"]
+    assert "assignee" not in sent["fields"]
+
+
+async def test_create_issue_all_fields():
+    with aioresponses() as m:
+        m.post(
+            f"{JIRA_BASE}/rest/api/3/issue",
+            payload={"id": "10002", "key": "TEST-2", "self": "..."},
+        )
+        result = await main.createJiraIssue(
+            projectKey="TEST",
+            summary="Full issue",
+            issueType="Story",
+            description="Some **bold** description",
+            priority="High",
+            labels=["backend", "urgent"],
+            assigneeAccountId="abc123",
+        )
+
+    assert "Created TEST-2" in result
+
+    call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue"))][0]
+    fields = call.kwargs["json"]["fields"]
+    assert fields["priority"] == {"name": "High"}
+    assert fields["labels"] == ["backend", "urgent"]
+    assert fields["assignee"] == {"accountId": "abc123"}
+    assert fields["description"]["type"] == "doc"
+    assert fields["description"]["version"] == 1
+
+
+async def test_create_issue_api_error():
+    with aioresponses() as m:
+        m.post(
+            f"{JIRA_BASE}/rest/api/3/issue",
+            payload={"errorMessages": [], "errors": {"summary": "Field is required"}},
+            status=400,
+        )
+        with pytest.raises(ToolError, match="summary"):
+            await main.createJiraIssue(
+                projectKey="TEST",
+                summary="",
+                issueType="Bug",
+            )
+
+
+# ---------------------------------------------------------------------------
+# getJiraIssue
+# ---------------------------------------------------------------------------
+
+
+async def test_get_issue():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/issue/TEST-1",
+            payload={
+                "key": "TEST-1",
+                "fields": {
+                    "summary": "Test issue",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Bug"},
+                    "priority": {"name": "High"},
+                    "assignee": {"displayName": "Alice"},
+                    "labels": ["backend"],
+                    "description": None,
+                },
+            },
+        )
+        result = await main.getJiraIssue("TEST-1")
+
+    assert "TEST-1" in result
+    assert "Test issue" in result
+    assert "Open" in result
+    assert "Bug" in result
+    assert "High" in result
+    assert "Alice" in result
+    assert "backend" in result
+
+
+# ---------------------------------------------------------------------------
+# searchJiraIssues
+# ---------------------------------------------------------------------------
+
+
+async def test_search_issues():
+    with aioresponses() as m:
+        m.get(
+            stdlib_re.compile(r"^https://openmrs\.atlassian\.net/rest/api/3/search"),
+            payload={
+                "total": 1,
+                "issues": [
+                    {
+                        "key": "TEST-1",
+                        "fields": {
+                            "summary": "Found issue",
+                            "status": {"name": "Open"},
+                            "assignee": None,
+                        },
+                    }
+                ],
+            },
+        )
+        result = await main.searchJiraIssues(jql="project = TEST")
+
+    assert "Found 1 issue(s)" in result
+    assert "TEST-1" in result
+    assert "Unassigned" in result
