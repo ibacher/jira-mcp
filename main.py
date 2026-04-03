@@ -1,11 +1,15 @@
 import json
 import os
 import re
+import sys
 from base64 import b64encode
+from io import TextIOWrapper
 
 import aiohttp
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.stdio import stdio_server
 
 mcp = FastMCP("jira-mcp")
 
@@ -260,7 +264,9 @@ async def createJiraIssue(
         projectKey: The Jira project key, e.g. "OCLOMRS"
         summary: One-line summary / title of the issue
         issueType: Issue type name, e.g. "Bug", "Task", "Story"
-        description: Optional description in Markdown (converted to ADF)
+        description: Optional description in Markdown (converted to ADF).
+            IMPORTANT: use literal \\n escape sequences for newlines, not
+            actual line breaks, to avoid breaking the JSON-RPC transport.
         priority: Optional priority name, e.g. "High", "Medium", "Low"
         labels: Optional list of label strings
         assigneeAccountId: Optional Jira account ID for the assignee
@@ -335,7 +341,9 @@ async def editJiraIssue(
     Args:
         issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
         summary: New summary / title
-        description: New description in Markdown (converted to ADF)
+        description: New description in Markdown (converted to ADF).
+            IMPORTANT: use literal \\n escape sequences for newlines, not
+            actual line breaks, to avoid breaking the JSON-RPC transport.
         priority: New priority name, e.g. "High", "Medium", "Low"
         labels: New set of labels (replaces existing labels)
         assigneeAccountId: Jira account ID for the assignee
@@ -405,7 +413,9 @@ async def addCommentToJiraIssue(issueIdOrKey: str, body: str) -> str:
 
     Args:
         issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-        body: Comment text in Markdown (converted to ADF)
+        body: Comment text in Markdown (converted to ADF).
+            IMPORTANT: use literal \\n escape sequences for newlines, not
+            actual line breaks, to avoid breaking the JSON-RPC transport.
     """
     status, resp_body = await _request(
         "POST",
@@ -538,5 +548,72 @@ async def lookupJiraAccountId(query: str, maxResults: int = 10) -> str:
     return "\n".join(lines)
 
 
+class _JsonLineBufferedStdin:
+    """Wraps an async text stream and buffers lines until they form valid JSON.
+
+    The MCP stdio transport expects one JSON-RPC message per line, but some
+    clients (notably Claude Desktop) may send multiline strings with literal
+    newlines, splitting a single JSON message across multiple lines.  This
+    wrapper accumulates lines until the buffer parses as valid JSON, then
+    re-serializes the message onto a single line (with newlines properly
+    escaped) before yielding it.
+    """
+
+    def __init__(self, raw_stdin: anyio.AsyncFile[str]):
+        self._stdin = raw_stdin
+        self._buffer = ""
+
+    def __aiter__(self):
+        return self
+
+    @staticmethod
+    def _try_parse(text: str) -> dict | None:
+        """Try to parse text as JSON, tolerating literal control characters."""
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            return None
+
+    async def __anext__(self) -> str:
+        async for line in self._stdin:
+            if not self._buffer:
+                # Fast path: try the line on its own first with the strict
+                # parser — if it passes, it's already well-formed.
+                try:
+                    json.loads(line)
+                    return line
+                except json.JSONDecodeError:
+                    self._buffer = line
+            else:
+                self._buffer += line
+
+            parsed = self._try_parse(self._buffer)
+            if parsed is not None:
+                self._buffer = ""
+                # Re-serialize so literal newlines become \\n escapes
+                # and the transport sees a single valid JSON line.
+                return json.dumps(parsed, ensure_ascii=False) + "\n"
+
+        # stdin exhausted
+        if self._buffer:
+            remaining = self._buffer
+            self._buffer = ""
+            return remaining
+        raise StopAsyncIteration
+
+
+async def _run_stdio():
+    raw_stdin = anyio.wrap_file(
+        TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    )
+    buffered = _JsonLineBufferedStdin(raw_stdin)
+    async with stdio_server(stdin=buffered) as (read_stream, write_stream):
+        await mcp._mcp_server.run(
+            read_stream,
+            write_stream,
+            mcp._mcp_server.create_initialization_options(),
+        )
+
+
 if __name__ == "__main__":
-    mcp.run()
+    anyio.run(_run_stdio)

@@ -3,6 +3,7 @@ import re as stdlib_re
 from base64 import b64encode
 
 import aiohttp
+import anyio
 import pytest
 import yarl
 from aioresponses import aioresponses
@@ -10,6 +11,7 @@ from aioresponses import aioresponses
 from mcp.server.fastmcp.exceptions import ToolError
 
 import main
+from main import _JsonLineBufferedStdin
 
 JIRA_BASE = "https://openmrs.atlassian.net"
 
@@ -311,3 +313,95 @@ async def test_search_issues():
     assert "Found 1 issue(s)" in result
     assert "TEST-1" in result
     assert "Unassigned" in result
+
+
+# ---------------------------------------------------------------------------
+# _JsonLineBufferedStdin
+# ---------------------------------------------------------------------------
+
+
+class _FakeAsyncStdin:
+    """Simulate an async stdin that yields pre-defined lines."""
+
+    def __init__(self, lines: list[str]):
+        self._iter = iter(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return next(self._iter)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+async def _collect(buffered: _JsonLineBufferedStdin) -> list[str]:
+    results = []
+    async for line in buffered:
+        results.append(line)
+    return results
+
+
+async def test_buffered_stdin_single_line_json():
+    """A well-formed single-line JSON message passes through immediately."""
+    msg = json.dumps({"jsonrpc": "2.0", "method": "test", "id": 1})
+    fake = _FakeAsyncStdin([msg + "\n"])
+    buffered = _JsonLineBufferedStdin(fake)
+    results = await _collect(buffered)
+    assert len(results) == 1
+    assert json.loads(results[0]) == {"jsonrpc": "2.0", "method": "test", "id": 1}
+
+
+async def test_buffered_stdin_multiline_string():
+    """A JSON message split across lines (literal newlines in a string) is reassembled."""
+    # Simulate what Claude Desktop sends: a JSON object where a string value
+    # contains literal newlines instead of \\n escapes.
+    original = {"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "name": "createJiraIssue",
+        "arguments": {"description": "line one\nline two\nline three"},
+    }, "id": 1}
+    # The properly-escaped JSON on one line:
+    proper_json = json.dumps(original)
+
+    # Now simulate what the buggy client sends: literal newlines in the string.
+    # This means the single JSON line becomes 3 lines on the wire.
+    broken = proper_json.replace("\\n", "\n")
+    lines = [l + "\n" for l in broken.split("\n")]
+
+    fake = _FakeAsyncStdin(lines)
+    buffered = _JsonLineBufferedStdin(fake)
+    results = await _collect(buffered)
+    assert len(results) == 1
+    parsed = json.loads(results[0])
+    assert parsed["params"]["arguments"]["description"] == "line one\nline two\nline three"
+
+
+async def test_buffered_stdin_multiple_messages():
+    """Multiple well-formed messages are each yielded individually."""
+    msg1 = json.dumps({"jsonrpc": "2.0", "method": "a", "id": 1}) + "\n"
+    msg2 = json.dumps({"jsonrpc": "2.0", "method": "b", "id": 2}) + "\n"
+    fake = _FakeAsyncStdin([msg1, msg2])
+    buffered = _JsonLineBufferedStdin(fake)
+    results = await _collect(buffered)
+    assert len(results) == 2
+    assert json.loads(results[0])["method"] == "a"
+    assert json.loads(results[1])["method"] == "b"
+
+
+async def test_buffered_stdin_mixed_good_and_broken():
+    """A well-formed message followed by a broken multiline one both come through."""
+    good = json.dumps({"jsonrpc": "2.0", "method": "init", "id": 1}) + "\n"
+
+    broken_obj = {"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "arguments": {"body": "## Heading\n\nParagraph"},
+    }, "id": 2}
+    broken_json = json.dumps(broken_obj).replace("\\n", "\n")
+    broken_lines = [l + "\n" for l in broken_json.split("\n")]
+
+    fake = _FakeAsyncStdin([good] + broken_lines)
+    buffered = _JsonLineBufferedStdin(fake)
+    results = await _collect(buffered)
+    assert len(results) == 2
+    assert json.loads(results[0])["method"] == "init"
+    assert json.loads(results[1])["params"]["arguments"]["body"] == "## Heading\n\nParagraph"
