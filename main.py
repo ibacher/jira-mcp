@@ -406,6 +406,9 @@ async def editJiraIssue(
     return f"Updated {issueIdOrKey}: {JIRA_BASE_URL}/browse/{issueIdOrKey}"
 
 
+_JIRA_PAGE_SIZE = 50
+
+
 @mcp.tool()
 async def searchJiraIssues(
     jql: str,
@@ -416,20 +419,37 @@ async def searchJiraIssues(
 
     Args:
         jql: JQL query string, e.g. "project = OCLOMRS AND status = Open"
-        maxResults: Maximum number of results to return (default 25)
+        maxResults: Maximum number of results to return (default 25).
+            Automatically paginates if this exceeds Jira's per-page limit.
         fields: Optional list of fields to return,
             e.g. ["summary", "status", "assignee"]
     """
-    params: dict = {"jql": jql, "maxResults": maxResults}
-    if fields:
-        params["fields"] = ",".join(fields)
+    issues: list[dict] = []
+    total = 0
+    start_at = 0
 
-    status, body = await _request("GET", "/rest/api/3/search", params=params)
-    if not _is_ok(status):
-        raise ToolError(_error_message(status, body))
+    while len(issues) < maxResults:
+        page_size = min(_JIRA_PAGE_SIZE, maxResults - len(issues))
+        params: dict = {
+            "jql": jql,
+            "maxResults": page_size,
+            "startAt": start_at,
+        }
+        if fields:
+            params["fields"] = ",".join(fields)
 
-    total = body.get("total", 0)
-    issues = body.get("issues", [])
+        status, body = await _request("GET", "/rest/api/3/search/jql", params=params)
+        if not _is_ok(status):
+            raise ToolError(_error_message(status, body))
+
+        total = body.get("total", 0)
+        page = body.get("issues", [])
+        issues.extend(page)
+
+        # Stop if Jira returned fewer than requested (last page).
+        if len(page) < page_size:
+            break
+        start_at += len(page)
 
     lines = [f"Found {total} issue(s) (showing {len(issues)}):"]
     for issue in issues:
@@ -562,31 +582,6 @@ async def getJiraIssueTypeMetaWithFields(projectIdOrKey: str, issueTypeId: str) 
         field_id = field.get("fieldId", field.get("key", "?"))
         name = field.get("name", field_id)
         lines.append(f"- {field_id}: {name}{required}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def lookupJiraAccountId(query: str, maxResults: int = 10) -> str:
-    """Search for Jira users by name or email to find their account ID.
-
-    Args:
-        query: Search string — name or email address
-        maxResults: Maximum number of results to return (default 10)
-    """
-    status, body = await _request(
-        "GET",
-        "/rest/api/3/user/search",
-        params={"query": query, "maxResults": maxResults},
-    )
-    if not _is_ok(status):
-        raise ToolError(_error_message(status, body))
-
-    if not body:
-        return f'No users found matching "{query}".'
-
-    lines = [f'Users matching "{query}":']
-    for u in body:
-        lines.append(f"- {u.get('displayName', '?')} — accountId: {u['accountId']}")
     return "\n".join(lines)
 
 

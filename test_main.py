@@ -294,7 +294,9 @@ async def test_get_issue():
 async def test_search_issues():
     with aioresponses() as m:
         m.get(
-            stdlib_re.compile(r"^https://openmrs\.atlassian\.net/rest/api/3/search"),
+            stdlib_re.compile(
+                r"^https://openmrs\.atlassian\.net/rest/api/3/search/jql"
+            ),
             payload={
                 "total": 1,
                 "issues": [
@@ -314,6 +316,48 @@ async def test_search_issues():
     assert "Found 1 issue(s)" in result
     assert "TEST-1" in result
     assert "Unassigned" in result
+
+
+async def test_search_issues_paginates(monkeypatch):
+    """When maxResults exceeds the page size, multiple requests are made."""
+    monkeypatch.setattr(main, "_JIRA_PAGE_SIZE", 2)
+
+    def _make_issue(key):
+        return {
+            "key": key,
+            "fields": {
+                "summary": f"Issue {key}",
+                "status": {"name": "Open"},
+                "assignee": None,
+            },
+        }
+
+    search_url = stdlib_re.compile(
+        r"^https://openmrs\.atlassian\.net/rest/api/3/search/jql"
+    )
+    with aioresponses() as m:
+        # Page 1: 2 issues (full page)
+        m.get(
+            search_url,
+            payload={
+                "total": 3,
+                "issues": [_make_issue("TEST-1"), _make_issue("TEST-2")],
+            },
+        )
+        # Page 2: 1 issue (last page)
+        m.get(
+            search_url,
+            payload={
+                "total": 3,
+                "issues": [_make_issue("TEST-3")],
+            },
+        )
+        result = await main.searchJiraIssues(jql="project = TEST", maxResults=5)
+
+    assert "Found 3 issue(s) (showing 3)" in result
+    assert "TEST-1" in result
+    assert "TEST-2" in result
+    assert "TEST-3" in result
 
 
 # ---------------------------------------------------------------------------
