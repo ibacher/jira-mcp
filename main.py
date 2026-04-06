@@ -4,6 +4,7 @@ import re
 import sys
 from base64 import b64encode
 from io import TextIOWrapper
+from typing import Any
 
 import aiohttp
 import anyio
@@ -20,7 +21,9 @@ def _auth_header() -> str:
     email = os.environ.get("JIRA_EMAIL")
     token = os.environ.get("JIRA_API_TOKEN")
     if not email or not token:
-        raise ValueError("JIRA_EMAIL and JIRA_API_TOKEN environment variables must be set")
+        raise ValueError(
+            "JIRA_EMAIL and JIRA_API_TOKEN environment variables must be set"
+        )
     credentials = b64encode(f"{email}:{token}".encode()).decode()
     return f"Basic {credentials}"
 
@@ -36,7 +39,7 @@ def _get_session() -> aiohttp.ClientSession:
     return _session
 
 
-async def _request(method: str, path: str, **kwargs) -> tuple[int, dict | str]:
+async def _request(method: str, path: str, **kwargs) -> tuple[int, Any]:
     """Make an authenticated request to the Jira REST API.
 
     Returns (status_code, parsed_json_or_text).
@@ -49,7 +52,9 @@ async def _request(method: str, path: str, **kwargs) -> tuple[int, dict | str]:
     timeout = aiohttp.ClientTimeout(total=kwargs.pop("timeout", 30))
 
     session = _get_session()
-    async with session.request(method, url, headers=headers, timeout=timeout, **kwargs) as resp:
+    async with session.request(
+        method, url, headers=headers, timeout=timeout, **kwargs
+    ) as resp:
         status = resp.status
         content_type = resp.content_type or ""
         if "json" in content_type:
@@ -59,7 +64,7 @@ async def _request(method: str, path: str, **kwargs) -> tuple[int, dict | str]:
         return status, body
 
 
-def _error_message(status: int, body: dict | str) -> str:
+def _error_message(status: int, body: Any) -> str:
     """Extract a readable error from a failed Jira response."""
     if isinstance(body, str):
         return f"Jira error (HTTP {status}): {body}"
@@ -81,6 +86,7 @@ def _is_ok(status: int) -> bool:
 # ---------------------------------------------------------------------------
 # Markdown -> ADF conversion
 # ---------------------------------------------------------------------------
+
 
 def _markdown_to_adf(markdown: str) -> dict:
     """Convert a Markdown string to a minimal Atlassian Document Format document.
@@ -123,11 +129,13 @@ def _markdown_to_adf(markdown: str) -> dict:
         heading_match = re.match(r"^(#{1,6})\s+(.*)", line)
         if heading_match:
             level = len(heading_match.group(1))
-            doc_content.append({
-                "type": "heading",
-                "attrs": {"level": level},
-                "content": _inline_markup(heading_match.group(2)),
-            })
+            doc_content.append(
+                {
+                    "type": "heading",
+                    "attrs": {"level": level},
+                    "content": _inline_markup(heading_match.group(2)),
+                }
+            )
             i += 1
             continue
 
@@ -136,10 +144,14 @@ def _markdown_to_adf(markdown: str) -> dict:
             items: list[dict] = []
             while i < len(lines) and re.match(r"^[\-\*]\s+", lines[i]):
                 text = re.sub(r"^[\-\*]\s+", "", lines[i])
-                items.append({
-                    "type": "listItem",
-                    "content": [{"type": "paragraph", "content": _inline_markup(text)}],
-                })
+                items.append(
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {"type": "paragraph", "content": _inline_markup(text)}
+                        ],
+                    }
+                )
                 i += 1
             doc_content.append({"type": "bulletList", "content": items})
             continue
@@ -149,30 +161,36 @@ def _markdown_to_adf(markdown: str) -> dict:
             items = []
             while i < len(lines) and re.match(r"^\d+\.\s+", lines[i]):
                 text = re.sub(r"^\d+\.\s+", "", lines[i])
-                items.append({
-                    "type": "listItem",
-                    "content": [{"type": "paragraph", "content": _inline_markup(text)}],
-                })
+                items.append(
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {"type": "paragraph", "content": _inline_markup(text)}
+                        ],
+                    }
+                )
                 i += 1
             doc_content.append({"type": "orderedList", "content": items})
             continue
 
         # Plain paragraph
-        doc_content.append({
-            "type": "paragraph",
-            "content": _inline_markup(line),
-        })
+        doc_content.append(
+            {
+                "type": "paragraph",
+                "content": _inline_markup(line),
+            }
+        )
         i += 1
 
     return {"version": 1, "type": "doc", "content": doc_content}
 
 
 _INLINE_PATTERN = re.compile(
-    r"(`[^`]+`)"                   # inline code
-    r"|(\*\*[^*]+\*\*)"           # bold
-    r"|(\*[^*]+\*)"               # italic with *
-    r"|(_[^_]+_)"                 # italic with _
-    r"|(\[[^\]]+\]\([^)]+\))"     # link
+    r"(`[^`]+`)"  # inline code
+    r"|(\*\*[^*]+\*\*)"  # bold
+    r"|(\*[^*]+\*)"  # italic with *
+    r"|(_[^_]+_)"  # italic with _
+    r"|(\[[^\]]+\]\([^)]+\))"  # link
 )
 
 
@@ -183,35 +201,45 @@ def _inline_markup(text: str) -> list[dict]:
 
     for m in _INLINE_PATTERN.finditer(text):
         if m.start() > pos:
-            nodes.append({"type": "text", "text": text[pos:m.start()]})
+            nodes.append({"type": "text", "text": text[pos : m.start()]})
 
         matched = m.group()
         if matched.startswith("`"):
-            nodes.append({
-                "type": "text",
-                "text": matched[1:-1],
-                "marks": [{"type": "code"}],
-            })
+            nodes.append(
+                {
+                    "type": "text",
+                    "text": matched[1:-1],
+                    "marks": [{"type": "code"}],
+                }
+            )
         elif matched.startswith("**"):
-            nodes.append({
-                "type": "text",
-                "text": matched[2:-2],
-                "marks": [{"type": "strong"}],
-            })
+            nodes.append(
+                {
+                    "type": "text",
+                    "text": matched[2:-2],
+                    "marks": [{"type": "strong"}],
+                }
+            )
         elif matched.startswith("["):
             link_match = re.match(r"\[([^\]]+)\]\(([^)]+)\)", matched)
             if link_match:
-                nodes.append({
-                    "type": "text",
-                    "text": link_match.group(1),
-                    "marks": [{"type": "link", "attrs": {"href": link_match.group(2)}}],
-                })
+                nodes.append(
+                    {
+                        "type": "text",
+                        "text": link_match.group(1),
+                        "marks": [
+                            {"type": "link", "attrs": {"href": link_match.group(2)}}
+                        ],
+                    }
+                )
         elif matched.startswith("*") or matched.startswith("_"):
-            nodes.append({
-                "type": "text",
-                "text": matched[1:-1],
-                "marks": [{"type": "em"}],
-            })
+            nodes.append(
+                {
+                    "type": "text",
+                    "text": matched[1:-1],
+                    "marks": [{"type": "em"}],
+                }
+            )
 
         pos = m.end()
 
@@ -247,6 +275,7 @@ def _adf_to_plain_text(node: dict | list | str | None) -> str:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
 
 @mcp.tool()
 async def createJiraIssue(
@@ -305,7 +334,9 @@ async def getJiraIssue(issueIdOrKey: str, fields: list[str] | None = None) -> st
     if fields:
         params["fields"] = ",".join(fields)
 
-    status, body = await _request("GET", f"/rest/api/3/issue/{issueIdOrKey}", params=params)
+    status, body = await _request(
+        "GET", f"/rest/api/3/issue/{issueIdOrKey}", params=params
+    )
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
@@ -366,7 +397,9 @@ async def editJiraIssue(
     if not fields:
         return "No fields provided to update."
 
-    status, body = await _request("PUT", f"/rest/api/3/issue/{issueIdOrKey}", json={"fields": fields})
+    status, body = await _request(
+        "PUT", f"/rest/api/3/issue/{issueIdOrKey}", json={"fields": fields}
+    )
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
@@ -384,7 +417,8 @@ async def searchJiraIssues(
     Args:
         jql: JQL query string, e.g. "project = OCLOMRS AND status = Open"
         maxResults: Maximum number of results to return (default 25)
-        fields: Optional list of fields to return, e.g. ["summary", "status", "assignee"]
+        fields: Optional list of fields to return,
+            e.g. ["summary", "status", "assignee"]
     """
     params: dict = {"jql": jql, "maxResults": maxResults}
     if fields:
@@ -402,7 +436,10 @@ async def searchJiraIssues(
         f = issue["fields"]
         issue_status = f["status"]["name"] if "status" in f else "?"
         assignee = f["assignee"]["displayName"] if f.get("assignee") else "Unassigned"
-        lines.append(f"- **{issue['key']}** [{issue_status}] {f.get('summary', '')} (Assignee: {assignee})")
+        summary = f.get("summary", "")
+        lines.append(
+            f"- **{issue['key']}** [{issue_status}] {summary} (Assignee: {assignee})"
+        )
 
     return "\n".join(lines)
 
@@ -435,7 +472,9 @@ async def getTransitionsForJiraIssue(issueIdOrKey: str) -> str:
     Args:
         issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
     """
-    status, body = await _request("GET", f"/rest/api/3/issue/{issueIdOrKey}/transitions")
+    status, body = await _request(
+        "GET", f"/rest/api/3/issue/{issueIdOrKey}/transitions"
+    )
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
@@ -445,7 +484,7 @@ async def getTransitionsForJiraIssue(issueIdOrKey: str) -> str:
 
     lines = [f"Available transitions for {issueIdOrKey}:"]
     for t in transitions:
-        lines.append(f"- id={t['id']} name=\"{t['name']}\" -> {t['to']['name']}")
+        lines.append(f'- id={t["id"]} name="{t["name"]}" -> {t["to"]["name"]}')
     return "\n".join(lines)
 
 
@@ -457,7 +496,8 @@ async def transitionJiraIssue(issueIdOrKey: str, transitionId: str) -> str:
 
     Args:
         issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-        transitionId: The ID of the transition to execute (from getTransitionsForJiraIssue)
+        transitionId: The ID of the transition to execute
+            (from getTransitionsForJiraIssue)
     """
     status, body = await _request(
         "POST",
@@ -477,7 +517,9 @@ async def getVisibleJiraProjects(maxResults: int = 50) -> str:
     Args:
         maxResults: Maximum number of projects to return (default 50)
     """
-    status, body = await _request("GET", "/rest/api/3/project/search", params={"maxResults": maxResults})
+    status, body = await _request(
+        "GET", "/rest/api/3/project/search", params={"maxResults": maxResults}
+    )
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
@@ -490,7 +532,7 @@ async def getVisibleJiraProjects(maxResults: int = 50) -> str:
 
 @mcp.tool()
 async def getJiraIssueTypeMetaWithFields(projectIdOrKey: str, issueTypeId: str) -> str:
-    """Get the create metadata (required/available fields) for an issue type in a project.
+    """Get the create metadata for an issue type in a project.
 
     Args:
         projectIdOrKey: Project key (e.g. "OCLOMRS") or numeric project ID
@@ -540,9 +582,9 @@ async def lookupJiraAccountId(query: str, maxResults: int = 10) -> str:
         raise ToolError(_error_message(status, body))
 
     if not body:
-        return f"No users found matching \"{query}\"."
+        return f'No users found matching "{query}".'
 
-    lines = [f"Users matching \"{query}\":"]
+    lines = [f'Users matching "{query}":']
     for u in body:
         lines.append(f"- {u.get('displayName', '?')} — accountId: {u['accountId']}")
     return "\n".join(lines)
@@ -559,11 +601,11 @@ class _JsonLineBufferedStdin:
     escaped) before yielding it.
     """
 
-    def __init__(self, raw_stdin: anyio.AsyncFile[str]):
+    def __init__(self, raw_stdin: Any):
         self._stdin = raw_stdin
         self._buffer = ""
 
-    def __aiter__(self):
+    def __aiter__(self) -> "_JsonLineBufferedStdin":
         return self
 
     @staticmethod
@@ -607,7 +649,10 @@ async def _run_stdio():
         TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
     )
     buffered = _JsonLineBufferedStdin(raw_stdin)
-    async with stdio_server(stdin=buffered) as (read_stream, write_stream):
+    streams = stdio_server(
+        stdin=buffered,  # ty: ignore[invalid-argument-type]
+    )
+    async with streams as (read_stream, write_stream):
         await mcp._mcp_server.run(
             read_stream,
             write_stream,

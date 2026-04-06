@@ -3,11 +3,9 @@ import re as stdlib_re
 from base64 import b64encode
 
 import aiohttp
-import anyio
 import pytest
 import yarl
 from aioresponses import aioresponses
-
 from mcp.server.fastmcp.exceptions import ToolError
 
 import main
@@ -61,6 +59,7 @@ async def test_request_sends_auth_header():
 
     assert status == 200
     assert body == {"ok": True}
+    assert m.requests is not None
     call = m.requests[("GET", yarl.URL(f"{JIRA_BASE}/rest/api/3/test"))][0]
     assert call.kwargs["headers"]["Authorization"] == f"Basic {expected_cred}"
 
@@ -199,6 +198,7 @@ async def test_create_issue_minimal():
     assert "Created TEST-1" in result
     assert f"{JIRA_BASE}/browse/TEST-1" in result
 
+    assert m.requests is not None
     call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue"))][0]
     sent = call.kwargs["json"]
     assert sent["fields"]["project"] == {"key": "TEST"}
@@ -228,6 +228,7 @@ async def test_create_issue_all_fields():
 
     assert "Created TEST-2" in result
 
+    assert m.requests is not None
     call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue"))][0]
     fields = call.kwargs["json"]["fields"]
     assert fields["priority"] == {"name": "High"}
@@ -333,7 +334,7 @@ class _FakeAsyncStdin:
         try:
             return next(self._iter)
         except StopIteration:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
 
 async def _collect(buffered: _JsonLineBufferedStdin) -> list[str]:
@@ -354,27 +355,34 @@ async def test_buffered_stdin_single_line_json():
 
 
 async def test_buffered_stdin_multiline_string():
-    """A JSON message split across lines (literal newlines in a string) is reassembled."""
+    """Literal newlines in a JSON string are reassembled."""
     # Simulate what Claude Desktop sends: a JSON object where a string value
     # contains literal newlines instead of \\n escapes.
-    original = {"jsonrpc": "2.0", "method": "tools/call", "params": {
-        "name": "createJiraIssue",
-        "arguments": {"description": "line one\nline two\nline three"},
-    }, "id": 1}
+    original = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "createJiraIssue",
+            "arguments": {"description": "line one\nline two\nline three"},
+        },
+        "id": 1,
+    }
     # The properly-escaped JSON on one line:
     proper_json = json.dumps(original)
 
     # Now simulate what the buggy client sends: literal newlines in the string.
     # This means the single JSON line becomes 3 lines on the wire.
     broken = proper_json.replace("\\n", "\n")
-    lines = [l + "\n" for l in broken.split("\n")]
+    lines = [part + "\n" for part in broken.split("\n")]
 
     fake = _FakeAsyncStdin(lines)
     buffered = _JsonLineBufferedStdin(fake)
     results = await _collect(buffered)
     assert len(results) == 1
     parsed = json.loads(results[0])
-    assert parsed["params"]["arguments"]["description"] == "line one\nline two\nline three"
+    assert (
+        parsed["params"]["arguments"]["description"] == "line one\nline two\nline three"
+    )
 
 
 async def test_buffered_stdin_multiple_messages():
@@ -393,15 +401,23 @@ async def test_buffered_stdin_mixed_good_and_broken():
     """A well-formed message followed by a broken multiline one both come through."""
     good = json.dumps({"jsonrpc": "2.0", "method": "init", "id": 1}) + "\n"
 
-    broken_obj = {"jsonrpc": "2.0", "method": "tools/call", "params": {
-        "arguments": {"body": "## Heading\n\nParagraph"},
-    }, "id": 2}
+    broken_obj = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "arguments": {"body": "## Heading\n\nParagraph"},
+        },
+        "id": 2,
+    }
     broken_json = json.dumps(broken_obj).replace("\\n", "\n")
-    broken_lines = [l + "\n" for l in broken_json.split("\n")]
+    broken_lines = [part + "\n" for part in broken_json.split("\n")]
 
     fake = _FakeAsyncStdin([good] + broken_lines)
     buffered = _JsonLineBufferedStdin(fake)
     results = await _collect(buffered)
     assert len(results) == 2
     assert json.loads(results[0])["method"] == "init"
-    assert json.loads(results[1])["params"]["arguments"]["body"] == "## Heading\n\nParagraph"
+    assert (
+        json.loads(results[1])["params"]["arguments"]["body"]
+        == "## Heading\n\nParagraph"
+    )

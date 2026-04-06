@@ -1,0 +1,13 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.2
+    hooks:
+      - id: ruff-format
+      - id: ruff
+        args: [--fix]
+
+  - repo: https://github.com/astral-sh/ty
+    rev: 0.0.28
+    hooks:
+      - id: ty
+        args: [check, main.py, test_main.py]
