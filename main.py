@@ -95,6 +95,10 @@ def _markdown_to_adf(markdown: str) -> dict:
     ordered lists (1. etc.), bold (**), italic (*/_), inline code (`),
     code blocks (```), and links ([text](url)).
     """
+    # Clients may send literal "\n" escape sequences (backslash + n) instead
+    # of real newlines — the tool docstrings even recommend this to avoid
+    # breaking JSON-RPC framing.  Normalise them before parsing.
+    markdown = markdown.replace("\\n", "\n")
     lines = markdown.split("\n")
     doc_content: list[dict] = []
     i = 0
@@ -189,7 +193,7 @@ _INLINE_PATTERN = re.compile(
     r"(`[^`]+`)"  # inline code
     r"|(\*\*[^*]+\*\*)"  # bold
     r"|(\*[^*]+\*)"  # italic with *
-    r"|(_[^_]+_)"  # italic with _
+    r"|(?<!\w)(_[^_]+_)(?!\w)"  # italic with _ (not mid-word)
     r"|(\[[^\]]+\]\([^)]+\))"  # link
 )
 

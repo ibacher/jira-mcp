@@ -162,11 +162,70 @@ def test_markdown_to_adf_inline_bold():
     assert nodes[1]["marks"] == [{"type": "strong"}]
 
 
+def test_markdown_to_adf_italic_underscore():
+    result = main._markdown_to_adf("some _italic_ text")
+    nodes = result["content"][0]["content"]
+    assert nodes[1]["text"] == "italic"
+    assert nodes[1]["marks"] == [{"type": "em"}]
+
+
+def test_markdown_to_adf_underscore_in_identifier():
+    """Mid-word underscores must not be treated as italic markers."""
+    result = main._markdown_to_adf("the release_publish_command option")
+    nodes = result["content"][0]["content"]
+    assert len(nodes) == 1
+    assert nodes[0]["text"] == "the release_publish_command option"
+
+
 def test_markdown_to_adf_inline_code():
     result = main._markdown_to_adf("use `foo()` here")
     nodes = result["content"][0]["content"]
     assert nodes[1]["text"] == "foo()"
     assert nodes[1]["marks"] == [{"type": "code"}]
+
+
+def test_markdown_to_adf_literal_backslash_n():
+    """Literal \\n escape sequences are normalised to real newlines before parsing."""
+    md = (
+        "First paragraph.\\n\\nSecond paragraph."
+        "\\n\\n```yaml\\nif: true\\n```"
+        "\\n\\nThe `pre-release` job."
+    )
+    result = main._markdown_to_adf(md)
+    types = [node["type"] for node in result["content"]]
+    assert types == ["paragraph", "paragraph", "codeBlock", "paragraph"]
+
+    # Code block has the right language and content
+    cb = result["content"][2]
+    assert cb["attrs"]["language"] == "yaml"
+    assert cb["content"][0]["text"] == "if: true"
+
+    # Inline code in the last paragraph is preserved
+    last_para = result["content"][3]
+    code_nodes = [n for n in last_para["content"] if n.get("marks")]
+    assert code_nodes[0]["text"] == "pre-release"
+    assert code_nodes[0]["marks"] == [{"type": "code"}]
+
+
+def test_markdown_to_adf_real_newlines():
+    """Real newlines still work after the \\n normalisation."""
+    md = (
+        "First paragraph.\n\nSecond paragraph."
+        "\n\n```yaml\nif: true\n```"
+        "\n\nThe `pre-release` job."
+    )
+    result = main._markdown_to_adf(md)
+    types = [node["type"] for node in result["content"]]
+    assert types == ["paragraph", "paragraph", "codeBlock", "paragraph"]
+
+    cb = result["content"][2]
+    assert cb["attrs"]["language"] == "yaml"
+    assert cb["content"][0]["text"] == "if: true"
+
+    last_para = result["content"][3]
+    code_nodes = [n for n in last_para["content"] if n.get("marks")]
+    assert code_nodes[0]["text"] == "pre-release"
+    assert code_nodes[0]["marks"] == [{"type": "code"}]
 
 
 def test_markdown_to_adf_link():
