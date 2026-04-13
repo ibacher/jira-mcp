@@ -420,6 +420,39 @@ async def test_search_issues_paginates(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# getMyself
+# ---------------------------------------------------------------------------
+
+
+async def test_get_myself():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/myself",
+            payload={
+                "accountId": "abc123",
+                "displayName": "Alice",
+                "emailAddress": "alice@example.com",
+            },
+        )
+        result = await main.getMyself()
+
+    assert "accountId: abc123" in result
+    assert "displayName: Alice" in result
+    assert "emailAddress: alice@example.com" in result
+
+
+async def test_get_myself_api_error():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/myself",
+            payload={"errorMessages": ["Not authenticated"]},
+            status=401,
+        )
+        with pytest.raises(ToolError, match="Not authenticated"):
+            await main.getMyself()
+
+
+# ---------------------------------------------------------------------------
 # _JsonLineBufferedStdin
 # ---------------------------------------------------------------------------
 

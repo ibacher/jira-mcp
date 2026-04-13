@@ -535,6 +535,20 @@ async def transitionJiraIssue(issueIdOrKey: str, transitionId: str) -> str:
 
 
 @mcp.tool()
+async def getMyself() -> str:
+    """Get the currently authenticated Jira user's account ID and display name."""
+    status, body = await _request("GET", "/rest/api/3/myself")
+    if not _is_ok(status):
+        raise ToolError(_error_message(status, body))
+
+    return (
+        f"accountId: {body['accountId']}\n"
+        f"displayName: {body.get('displayName', '(unknown)')}\n"
+        f"emailAddress: {body.get('emailAddress', '(hidden)')}"
+    )
+
+
+@mcp.tool()
 async def getVisibleJiraProjects(maxResults: int = 50) -> str:
     """List Jira projects visible to the authenticated user.
 
