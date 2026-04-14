@@ -20,6 +20,23 @@ A local MCP server that wraps the Jira REST API v3 for `openmrs.atlassian.net`, 
 | `JIRA_API_TOKEN` | Yes | The API token you generated above |
 | `JIRA_BASE_URL` | No | Defaults to `https://openmrs.atlassian.net` |
 
+## Installation
+
+Install as a tool so it's available as a standalone command:
+
+```bash
+uv tool install /absolute/path/to/jira-mcp
+```
+
+Replace `/absolute/path/to/jira-mcp` with the actual path to this directory.
+This creates a `jira-mcp` command (typically at `~/.local/bin/jira-mcp`).
+
+To update after pulling changes:
+
+```bash
+uv tool install --force /absolute/path/to/jira-mcp
+```
+
 ## Claude Desktop MCP Config
 
 Add the following to your Claude Desktop config file:
@@ -32,8 +49,7 @@ Add the following to your Claude Desktop config file:
 {
   "mcpServers": {
     "jira": {
-      "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/jira-mcp", "python", "main.py"],
+      "command": "jira-mcp",
       "env": {
         "JIRA_EMAIL": "you@example.com",
         "JIRA_API_TOKEN": "your-api-token-here"
@@ -43,7 +59,8 @@ Add the following to your Claude Desktop config file:
 }
 ```
 
-Replace `/absolute/path/to/jira-mcp` with the actual path to this directory.
+If `jira-mcp` is not on Claude Desktop's `PATH`, use the full path
+(e.g. `"/Users/you/.local/bin/jira-mcp"`).
 
 ## Claude Code MCP Config
 
@@ -53,8 +70,7 @@ In your Claude Code settings (e.g. `~/.claude/settings.json`), add:
 {
   "mcpServers": {
     "jira": {
-      "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/jira-mcp", "python", "main.py"],
+      "command": "jira-mcp",
       "env": {
         "JIRA_EMAIL": "you@example.com",
         "JIRA_API_TOKEN": "your-api-token-here"

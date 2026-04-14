@@ -673,5 +673,9 @@ async def _run_stdio():
         )
 
 
-if __name__ == "__main__":
+def main():
     anyio.run(_run_stdio)
+
+
+if __name__ == "__main__":
+    main()

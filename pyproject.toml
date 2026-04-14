@@ -19,6 +19,9 @@ dev = [
     "ty>=0.0.1a7",
 ]
 
+[project.scripts]
+jira-mcp = "main:main"
+
 [tool.setuptools]
 py-modules = ["main"]
 
