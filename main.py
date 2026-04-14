@@ -571,7 +571,7 @@ async def getJiraIssueTypeMetaWithFields(
     ],
     issueTypeId: Annotated[str, Field(description="Numeric issue type ID")],
 ) -> str:
-    """Get create metadata for an issue type in a project."""
+    """Get Jira create metadata for an issue type in a project."""
     status, body = await _request(
         "GET",
         f"/rest/api/3/issue/createmeta/{projectIdOrKey}/issuetypes/{issueTypeId}",
