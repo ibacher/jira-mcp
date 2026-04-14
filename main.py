@@ -4,13 +4,14 @@ import re
 import sys
 from base64 import b64encode
 from io import TextIOWrapper
-from typing import Any
+from typing import Annotated, Any
 
 import aiohttp
 import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
+from pydantic import Field
 
 mcp = FastMCP("jira-mcp")
 
@@ -283,27 +284,23 @@ def _adf_to_plain_text(node: dict | list | str | None) -> str:
 
 @mcp.tool()
 async def createJiraIssue(
-    projectKey: str,
-    summary: str,
-    issueType: str,
-    description: str | None = None,
-    priority: str | None = None,
-    labels: list[str] | None = None,
-    assigneeAccountId: str | None = None,
+    projectKey: Annotated[str, Field(description='Project key, e.g. "OCLOMRS"')],
+    summary: Annotated[str, Field(description="One-line summary / title")],
+    issueType: Annotated[
+        str, Field(description='Issue type, e.g. "Bug", "Task", "Story"')
+    ],
+    description: Annotated[
+        str | None, Field(description="Description in Markdown (converted to ADF)")
+    ] = None,
+    priority: Annotated[
+        str | None, Field(description='Priority, e.g. "High", "Medium", "Low"')
+    ] = None,
+    labels: Annotated[list[str] | None, Field(description="Label strings")] = None,
+    assigneeAccountId: Annotated[
+        str | None, Field(description="Jira account ID for the assignee")
+    ] = None,
 ) -> str:
-    """Create a Jira issue in the OpenMRS Jira instance.
-
-    Args:
-        projectKey: The Jira project key, e.g. "OCLOMRS"
-        summary: One-line summary / title of the issue
-        issueType: Issue type name, e.g. "Bug", "Task", "Story"
-        description: Optional description in Markdown (converted to ADF).
-            IMPORTANT: use literal \\n escape sequences for newlines, not
-            actual line breaks, to avoid breaking the JSON-RPC transport.
-        priority: Optional priority name, e.g. "High", "Medium", "Low"
-        labels: Optional list of label strings
-        assigneeAccountId: Optional Jira account ID for the assignee
-    """
+    """Create a new Jira issue."""
     fields: dict = {
         "project": {"key": projectKey},
         "summary": summary,
@@ -327,13 +324,16 @@ async def createJiraIssue(
 
 
 @mcp.tool()
-async def getJiraIssue(issueIdOrKey: str, fields: list[str] | None = None) -> str:
-    """Fetch a Jira issue by key or ID.
-
-    Args:
-        issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-        fields: Optional list of field names to return, e.g. ["summary", "status"]
-    """
+async def getJiraIssue(
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+    fields: Annotated[
+        list[str] | None,
+        Field(description='Field names to return, e.g. ["summary", "status"]'),
+    ] = None,
+) -> str:
+    """Fetch a Jira issue by key or ID."""
     params = {}
     if fields:
         params["fields"] = ",".join(fields)
@@ -363,27 +363,27 @@ async def getJiraIssue(issueIdOrKey: str, fields: list[str] | None = None) -> st
 
 @mcp.tool()
 async def editJiraIssue(
-    issueIdOrKey: str,
-    summary: str | None = None,
-    description: str | None = None,
-    priority: str | None = None,
-    labels: list[str] | None = None,
-    assigneeAccountId: str | None = None,
-    issueType: str | None = None,
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+    summary: Annotated[str | None, Field(description="New summary / title")] = None,
+    description: Annotated[
+        str | None, Field(description="New description in Markdown (converted to ADF)")
+    ] = None,
+    priority: Annotated[
+        str | None, Field(description='Priority, e.g. "High", "Medium", "Low"')
+    ] = None,
+    labels: Annotated[
+        list[str] | None, Field(description="New set of labels (replaces existing)")
+    ] = None,
+    assigneeAccountId: Annotated[
+        str | None, Field(description="Jira account ID for the assignee")
+    ] = None,
+    issueType: Annotated[
+        str | None, Field(description='Issue type, e.g. "Bug", "Task", "Story"')
+    ] = None,
 ) -> str:
-    """Edit fields on an existing Jira issue.
-
-    Args:
-        issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-        summary: New summary / title
-        description: New description in Markdown (converted to ADF).
-            IMPORTANT: use literal \\n escape sequences for newlines, not
-            actual line breaks, to avoid breaking the JSON-RPC transport.
-        priority: New priority name, e.g. "High", "Medium", "Low"
-        labels: New set of labels (replaces existing labels)
-        assigneeAccountId: Jira account ID for the assignee
-        issueType: New issue type name, e.g. "Bug", "Task", "Story"
-    """
+    """Edit fields on an existing Jira issue."""
     fields: dict = {}
     if summary is not None:
         fields["summary"] = summary
@@ -415,19 +415,18 @@ _JIRA_PAGE_SIZE = 50
 
 @mcp.tool()
 async def searchJiraIssues(
-    jql: str,
-    maxResults: int = 25,
-    fields: list[str] | None = None,
+    jql: Annotated[
+        str, Field(description='JQL query, e.g. "project = OCLOMRS AND status = Open"')
+    ],
+    maxResults: Annotated[
+        int, Field(description="Max results (paginates automatically)")
+    ] = 25,
+    fields: Annotated[
+        list[str] | None,
+        Field(description='Fields to return, e.g. ["summary", "status"]'),
+    ] = None,
 ) -> str:
-    """Search for Jira issues using JQL.
-
-    Args:
-        jql: JQL query string, e.g. "project = OCLOMRS AND status = Open"
-        maxResults: Maximum number of results to return (default 25).
-            Automatically paginates if this exceeds Jira's per-page limit.
-        fields: Optional list of fields to return,
-            e.g. ["summary", "status", "assignee"]
-    """
+    """Search for Jira issues using JQL."""
     issues: list[dict] = []
     total = 0
     start_at = 0
@@ -469,15 +468,15 @@ async def searchJiraIssues(
 
 
 @mcp.tool()
-async def addCommentToJiraIssue(issueIdOrKey: str, body: str) -> str:
-    """Add a comment to a Jira issue.
-
-    Args:
-        issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-        body: Comment text in Markdown (converted to ADF).
-            IMPORTANT: use literal \\n escape sequences for newlines, not
-            actual line breaks, to avoid breaking the JSON-RPC transport.
-    """
+async def addCommentToJiraIssue(
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+    body: Annotated[
+        str, Field(description="Comment text in Markdown (converted to ADF)")
+    ],
+) -> str:
+    """Add a comment to a Jira issue."""
     status, resp_body = await _request(
         "POST",
         f"/rest/api/3/issue/{issueIdOrKey}/comment",
@@ -490,12 +489,12 @@ async def addCommentToJiraIssue(issueIdOrKey: str, body: str) -> str:
 
 
 @mcp.tool()
-async def getTransitionsForJiraIssue(issueIdOrKey: str) -> str:
-    """List the available workflow transitions for a Jira issue.
-
-    Args:
-        issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-    """
+async def getTransitionsForJiraIssue(
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+) -> str:
+    """List available workflow transitions for a Jira issue."""
     status, body = await _request(
         "GET", f"/rest/api/3/issue/{issueIdOrKey}/transitions"
     )
@@ -513,16 +512,15 @@ async def getTransitionsForJiraIssue(issueIdOrKey: str) -> str:
 
 
 @mcp.tool()
-async def transitionJiraIssue(issueIdOrKey: str, transitionId: str) -> str:
-    """Transition a Jira issue to a new status.
-
-    Use getTransitionsForJiraIssue first to find the available transition IDs.
-
-    Args:
-        issueIdOrKey: Issue key (e.g. "OCLOMRS-123") or numeric ID
-        transitionId: The ID of the transition to execute
-            (from getTransitionsForJiraIssue)
-    """
+async def transitionJiraIssue(
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+    transitionId: Annotated[
+        str, Field(description="Transition ID (from getTransitionsForJiraIssue)")
+    ],
+) -> str:
+    """Transition a Jira issue to a new status."""
     status, body = await _request(
         "POST",
         f"/rest/api/3/issue/{issueIdOrKey}/transitions",
@@ -549,12 +547,10 @@ async def getMyself() -> str:
 
 
 @mcp.tool()
-async def getVisibleJiraProjects(maxResults: int = 50) -> str:
-    """List Jira projects visible to the authenticated user.
-
-    Args:
-        maxResults: Maximum number of projects to return (default 50)
-    """
+async def getVisibleJiraProjects(
+    maxResults: Annotated[int, Field(description="Max projects to return")] = 50,
+) -> str:
+    """List Jira projects visible to the authenticated user."""
     status, body = await _request(
         "GET", "/rest/api/3/project/search", params={"maxResults": maxResults}
     )
@@ -569,13 +565,13 @@ async def getVisibleJiraProjects(maxResults: int = 50) -> str:
 
 
 @mcp.tool()
-async def getJiraIssueTypeMetaWithFields(projectIdOrKey: str, issueTypeId: str) -> str:
-    """Get the create metadata for an issue type in a project.
-
-    Args:
-        projectIdOrKey: Project key (e.g. "OCLOMRS") or numeric project ID
-        issueTypeId: Numeric issue type ID (get these from the project metadata)
-    """
+async def getJiraIssueTypeMetaWithFields(
+    projectIdOrKey: Annotated[
+        str, Field(description='Project key (e.g. "OCLOMRS") or numeric ID')
+    ],
+    issueTypeId: Annotated[str, Field(description="Numeric issue type ID")],
+) -> str:
+    """Get create metadata for an issue type in a project."""
     status, body = await _request(
         "GET",
         f"/rest/api/3/issue/createmeta/{projectIdOrKey}/issuetypes/{issueTypeId}",
