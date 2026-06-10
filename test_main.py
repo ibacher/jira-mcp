@@ -378,7 +378,7 @@ async def test_search_issues():
 
 
 async def test_search_issues_paginates(monkeypatch):
-    """When maxResults exceeds the page size, multiple requests are made."""
+    """When Jira returns nextPageToken, it is used for the next page."""
     monkeypatch.setattr(main, "_JIRA_PAGE_SIZE", 2)
 
     def _make_issue(key):
@@ -399,7 +399,8 @@ async def test_search_issues_paginates(monkeypatch):
         m.get(
             search_url,
             payload={
-                "total": 3,
+                "isLast": False,
+                "nextPageToken": "page-2",
                 "issues": [_make_issue("TEST-1"), _make_issue("TEST-2")],
             },
         )
@@ -407,7 +408,7 @@ async def test_search_issues_paginates(monkeypatch):
         m.get(
             search_url,
             payload={
-                "total": 3,
+                "isLast": True,
                 "issues": [_make_issue("TEST-3")],
             },
         )
@@ -417,6 +418,97 @@ async def test_search_issues_paginates(monkeypatch):
     assert "TEST-1" in result
     assert "TEST-2" in result
     assert "TEST-3" in result
+    assert m.requests is not None
+    calls = [call for calls in m.requests.values() for call in calls]
+    assert calls[0].kwargs["params"] == {
+        "jql": "project = TEST",
+        "maxResults": 2,
+    }
+    assert calls[1].kwargs["params"] == {
+        "jql": "project = TEST",
+        "maxResults": 2,
+        "nextPageToken": "page-2",
+    }
+
+
+# ---------------------------------------------------------------------------
+# getJiraIssueTypeMetaWithFields
+# ---------------------------------------------------------------------------
+
+
+async def test_issue_type_meta_paginates_fields(monkeypatch):
+    monkeypatch.setattr(main, "_JIRA_PAGE_SIZE", 1)
+
+    meta_url = stdlib_re.compile(
+        r"^https://openmrs\.atlassian\.net/rest/api/3/issue/createmeta/TEST/issuetypes/10001"
+    )
+    with aioresponses() as m:
+        m.get(
+            meta_url,
+            payload={
+                "fields": [{"fieldId": "summary", "name": "Summary", "required": True}],
+                "maxResults": 1,
+                "startAt": 0,
+                "total": 2,
+            },
+        )
+        m.get(
+            meta_url,
+            payload={
+                "fields": [
+                    {
+                        "fieldId": "description",
+                        "name": "Description",
+                        "required": False,
+                    }
+                ],
+                "maxResults": 1,
+                "startAt": 1,
+                "total": 2,
+            },
+        )
+        result = await main.getJiraIssueTypeMetaWithFields("TEST", "10001")
+
+    assert "- summary: Summary (required)" in result
+    assert "- description: Description" in result
+    assert m.requests is not None
+    calls = [call for calls in m.requests.values() for call in calls]
+    assert calls[0].kwargs["params"] == {"startAt": 0, "maxResults": 1}
+    assert calls[1].kwargs["params"] == {"startAt": 1, "maxResults": 1}
+
+
+# ---------------------------------------------------------------------------
+# lookupJiraAccountId
+# ---------------------------------------------------------------------------
+
+
+async def test_lookup_jira_account_id():
+    user_search_url = stdlib_re.compile(
+        r"^https://openmrs\.atlassian\.net/rest/api/3/user/search"
+    )
+    with aioresponses() as m:
+        m.get(
+            user_search_url,
+            payload=[
+                {
+                    "accountId": "abc123",
+                    "displayName": "Alice Example",
+                    "emailAddress": "alice@example.com",
+                },
+                {
+                    "accountId": "def456",
+                    "displayName": "Bob Example",
+                },
+            ],
+        )
+        result = await main.lookupJiraAccountId(query="alice", maxResults=10)
+
+    assert "Found 2 user(s):" in result
+    assert "- Alice Example <alice@example.com> accountId=abc123" in result
+    assert "- Bob Example <hidden> accountId=def456" in result
+    assert m.requests is not None
+    call = next(call for calls in m.requests.values() for call in calls)
+    assert call.kwargs["params"] == {"query": "alice", "maxResults": 10}
 
 
 # ---------------------------------------------------------------------------
