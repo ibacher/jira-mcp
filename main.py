@@ -428,16 +428,17 @@ async def searchJiraIssues(
 ) -> str:
     """Search for Jira issues using JQL."""
     issues: list[dict] = []
-    total = 0
-    start_at = 0
+    total: int | None = None
+    next_page_token: str | None = None
 
     while len(issues) < maxResults:
         page_size = min(_JIRA_PAGE_SIZE, maxResults - len(issues))
         params: dict = {
             "jql": jql,
             "maxResults": page_size,
-            "startAt": start_at,
         }
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
         if fields:
             params["fields"] = ",".join(fields)
 
@@ -445,16 +446,17 @@ async def searchJiraIssues(
         if not _is_ok(status):
             raise ToolError(_error_message(status, body))
 
-        total = body.get("total", 0)
+        if "total" in body:
+            total = body["total"]
         page = body.get("issues", [])
         issues.extend(page)
 
-        # Stop if Jira returned fewer than requested (last page).
-        if len(page) < page_size:
+        next_page_token = body.get("nextPageToken")
+        if body.get("isLast") is True or not next_page_token or not page:
             break
-        start_at += len(page)
 
-    lines = [f"Found {total} issue(s) (showing {len(issues)}):"]
+    issue_count = total if total is not None else len(issues)
+    lines = [f"Found {issue_count} issue(s) (showing {len(issues)}):"]
     for issue in issues:
         f = issue["fields"]
         issue_status = f["status"]["name"] if "status" in f else "?"
@@ -547,6 +549,36 @@ async def getMyself() -> str:
 
 
 @mcp.tool()
+async def lookupJiraAccountId(
+    query: Annotated[
+        str,
+        Field(description="Name or email address to search for"),
+    ],
+    maxResults: Annotated[int, Field(description="Max users to return")] = 10,
+) -> str:
+    """Search Jira users and return their account IDs."""
+    status, body = await _request(
+        "GET",
+        "/rest/api/3/user/search",
+        params={"query": query, "maxResults": maxResults},
+    )
+    if not _is_ok(status):
+        raise ToolError(_error_message(status, body))
+
+    users = body if isinstance(body, list) else []
+    if not users:
+        return f'No Jira users found for "{query}".'
+
+    lines = [f"Found {len(users)} user(s):"]
+    for user in users:
+        display_name = user.get("displayName", "(unknown)")
+        email = user.get("emailAddress", "hidden")
+        account_id = user.get("accountId", "(unknown)")
+        lines.append(f"- {display_name} <{email}> accountId={account_id}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def getVisibleJiraProjects(
     maxResults: Annotated[int, Field(description="Max projects to return")] = 50,
 ) -> str:
@@ -572,22 +604,41 @@ async def getJiraIssueTypeMetaWithFields(
     issueTypeId: Annotated[str, Field(description="Numeric issue type ID")],
 ) -> str:
     """Get Jira create metadata for an issue type in a project."""
-    status, body = await _request(
-        "GET",
-        f"/rest/api/3/issue/createmeta/{projectIdOrKey}/issuetypes/{issueTypeId}",
-    )
-    if not _is_ok(status):
-        raise ToolError(_error_message(status, body))
+    fields_list: list[dict] = []
+    start_at = 0
+    total: int | None = None
 
-    fields_list = body.get("values", body.get("fields", []))
+    while True:
+        page_size = _JIRA_PAGE_SIZE
+        status, body = await _request(
+            "GET",
+            f"/rest/api/3/issue/createmeta/{projectIdOrKey}/issuetypes/{issueTypeId}",
+            params={"startAt": start_at, "maxResults": page_size},
+        )
+        if not _is_ok(status):
+            raise ToolError(_error_message(status, body))
 
-    # Dict of field objects (older API shape)
-    if isinstance(fields_list, dict):
-        lines = [f"Fields for project {projectIdOrKey}, issue type {issueTypeId}:"]
-        for key, meta in fields_list.items():
-            required = " (required)" if meta.get("required") else ""
-            lines.append(f"- {key}: {meta.get('name', key)}{required}")
-        return "\n".join(lines)
+        page = body.get("values", body.get("fields", []))
+
+        # Dict of field objects (older API shape)
+        if isinstance(page, dict):
+            lines = [f"Fields for project {projectIdOrKey}, issue type {issueTypeId}:"]
+            for key, meta in page.items():
+                required = " (required)" if meta.get("required") else ""
+                lines.append(f"- {key}: {meta.get('name', key)}{required}")
+            return "\n".join(lines)
+
+        fields_list.extend(page)
+        if "total" in body:
+            total = body["total"]
+
+        if body.get("isLast") is True or not page:
+            break
+        if total is not None and len(fields_list) >= total:
+            break
+        if total is None and len(page) < page_size:
+            break
+        start_at += len(page)
 
     # Paginated list shape
     lines = [f"Fields for project {projectIdOrKey}, issue type {issueTypeId}:"]

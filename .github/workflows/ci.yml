@@ -21,16 +21,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv pip install -e '.[dev]' --system
+        run: uv sync --locked --extra dev
 
       - name: Ruff format check
-        run: ruff format --check .
+        run: uv run ruff format --check .
 
       - name: Ruff lint
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Ty type-check
-        run: ty check main.py test_main.py
+        run: uv run ty check main.py test_main.py
 
       - name: Tests
-        run: pytest test_main.py -v
+        run: uv run pytest test_main.py -v
