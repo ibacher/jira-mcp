@@ -40,6 +40,14 @@ def _get_session() -> aiohttp.ClientSession:
     return _session
 
 
+async def _close_session() -> None:
+    """Close the shared ClientSession if one is open."""
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
 async def _request(method: str, path: str, **kwargs) -> tuple[int, Any]:
     """Make an authenticated request to the Jira REST API.
 
@@ -53,22 +61,49 @@ async def _request(method: str, path: str, **kwargs) -> tuple[int, Any]:
     timeout = aiohttp.ClientTimeout(total=kwargs.pop("timeout", 30))
 
     session = _get_session()
-    async with session.request(
-        method, url, headers=headers, timeout=timeout, **kwargs
-    ) as resp:
-        status = resp.status
-        content_type = resp.content_type or ""
-        if "json" in content_type:
-            body = await resp.json()
-        else:
-            body = await resp.text()
-        return status, body
+    try:
+        async with session.request(
+            method, url, headers=headers, timeout=timeout, **kwargs
+        ) as resp:
+            status = resp.status
+            content_type = resp.content_type or ""
+            if "json" in content_type:
+                try:
+                    body = await resp.json()
+                except (
+                    aiohttp.ClientPayloadError,
+                    aiohttp.ContentTypeError,
+                    json.JSONDecodeError,
+                ) as e:
+                    # Jira claimed JSON but sent something else (e.g. an HTML
+                    # error page from a proxy). Surface it rather than letting
+                    # a downstream KeyError mask the real cause.
+                    text = await resp.text()
+                    raise ToolError(
+                        f"Jira returned an unparseable response (HTTP {status}): "
+                        f"{text[:500]}"
+                    ) from e
+            else:
+                body = await resp.text()
+            return status, body
+    # In Python 3.11+ asyncio.TimeoutError is an alias of the builtin, which the
+    # ClientTimeout above raises when the request exceeds its deadline.
+    except TimeoutError as e:
+        raise ToolError(
+            f"Request to Jira timed out after {timeout.total}s: {method} {path}"
+        ) from e
+    except aiohttp.ClientError as e:
+        raise ToolError(f"Could not reach Jira ({JIRA_BASE_URL}): {e}") from e
 
 
 def _error_message(status: int, body: Any) -> str:
     """Extract a readable error from a failed Jira response."""
     if isinstance(body, str):
         return f"Jira error (HTTP {status}): {body}"
+    if not isinstance(body, dict):
+        # Some Jira endpoints return a JSON array (or null) on error; the
+        # field-extraction below assumes a dict, so fall back to raw JSON.
+        return f"Jira error (HTTP {status}): {json.dumps(body)}"
     parts = []
     if "errorMessages" in body:
         parts.extend(body["errorMessages"])
@@ -193,7 +228,7 @@ def _markdown_to_adf(markdown: str) -> dict:
 _INLINE_PATTERN = re.compile(
     r"(`[^`]+`)"  # inline code
     r"|(\*\*[^*]+\*\*)"  # bold
-    r"|(\*[^*]+\*)"  # italic with *
+    r"|(\*(?!\s)[^*]+(?<!\s)\*)"  # italic with * (markers must abut non-space)
     r"|(?<!\w)(_[^_]+_)(?!\w)"  # italic with _ (not mid-word)
     r"|(\[[^\]]+\]\([^)]+\))"  # link
 )
@@ -319,7 +354,12 @@ async def createJiraIssue(
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
-    key = body["key"]
+    key = body.get("key") if isinstance(body, dict) else None
+    if not key:
+        raise ToolError(
+            f"Jira accepted the request (HTTP {status}) but returned no issue key: "
+            f"{body!r}"
+        )
     return f"Created {key}: {JIRA_BASE_URL}/browse/{key}"
 
 
@@ -344,12 +384,17 @@ async def getJiraIssue(
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
-    f = body["fields"]
+    f = body.get("fields") if isinstance(body, dict) else None
+    if not isinstance(f, dict):
+        raise ToolError(
+            f"Jira returned an unexpected issue shape (HTTP {status}): {body!r}"
+        )
+    key = body.get("key", "(unknown)")
     lines = [
-        f"**{body['key']}**: {f.get('summary', '(no summary)')}",
-        f"URL: {JIRA_BASE_URL}/browse/{body['key']}",
-        f"Status: {f['status']['name']}" if "status" in f else None,
-        f"Type: {f['issuetype']['name']}" if "issuetype" in f else None,
+        f"**{key}**: {f.get('summary', '(no summary)')}",
+        f"URL: {JIRA_BASE_URL}/browse/{key}",
+        f"Status: {f['status']['name']}" if f.get("status") else None,
+        f"Type: {f['issuetype']['name']}" if f.get("issuetype") else None,
         f"Priority: {f['priority']['name']}" if f.get("priority") else None,
         f"Assignee: {f['assignee']['displayName']}" if f.get("assignee") else None,
         f"Labels: {', '.join(f['labels'])}" if f.get("labels") else None,
@@ -428,8 +473,8 @@ async def searchJiraIssues(
 ) -> str:
     """Search for Jira issues using JQL."""
     issues: list[dict] = []
-    total: int | None = None
     next_page_token: str | None = None
+    more_available = False
 
     while len(issues) < maxResults:
         page_size = min(_JIRA_PAGE_SIZE, maxResults - len(issues))
@@ -445,26 +490,34 @@ async def searchJiraIssues(
         status, body = await _request("GET", "/rest/api/3/search/jql", params=params)
         if not _is_ok(status):
             raise ToolError(_error_message(status, body))
+        if not isinstance(body, dict):
+            raise ToolError(
+                f"Jira returned an unexpected search response (HTTP {status}): {body!r}"
+            )
 
-        if "total" in body:
-            total = body["total"]
         page = body.get("issues", [])
         issues.extend(page)
 
         next_page_token = body.get("nextPageToken")
         if body.get("isLast") is True or not next_page_token or not page:
             break
+    else:
+        # Loop exited because we hit maxResults; a remaining token means the
+        # enhanced /search/jql endpoint (which does not report a total) has
+        # more matches than we fetched.
+        more_available = bool(next_page_token)
 
-    issue_count = total if total is not None else len(issues)
-    lines = [f"Found {issue_count} issue(s) (showing {len(issues)}):"]
+    header = f"Showing {len(issues)} issue(s)"
+    if more_available:
+        header += " (more available — increase maxResults)"
+    lines = [f"{header}:"]
     for issue in issues:
-        f = issue["fields"]
-        issue_status = f["status"]["name"] if "status" in f else "?"
+        f = issue.get("fields", {}) if isinstance(issue, dict) else {}
+        issue_status = f["status"]["name"] if f.get("status") else "?"
         assignee = f["assignee"]["displayName"] if f.get("assignee") else "Unassigned"
         summary = f.get("summary", "")
-        lines.append(
-            f"- **{issue['key']}** [{issue_status}] {summary} (Assignee: {assignee})"
-        )
+        key = issue.get("key", "(unknown)") if isinstance(issue, dict) else "(unknown)"
+        lines.append(f"- **{key}** [{issue_status}] {summary} (Assignee: {assignee})")
 
     return "\n".join(lines)
 
@@ -487,7 +540,10 @@ async def addCommentToJiraIssue(
     if not _is_ok(status):
         raise ToolError(_error_message(status, resp_body))
 
-    return f"Comment added (id: {resp_body['id']}) to {issueIdOrKey}"
+    comment_id = (
+        resp_body.get("id", "(unknown)") if isinstance(resp_body, dict) else "(unknown)"
+    )
+    return f"Comment added (id: {comment_id}) to {issueIdOrKey}"
 
 
 @mcp.tool()
@@ -509,7 +565,9 @@ async def getTransitionsForJiraIssue(
 
     lines = [f"Available transitions for {issueIdOrKey}:"]
     for t in transitions:
-        lines.append(f'- id={t["id"]} name="{t["name"]}" -> {t["to"]["name"]}')
+        to = t.get("to") if isinstance(t, dict) else None
+        to_name = to.get("name", "?") if isinstance(to, dict) else "?"
+        lines.append(f'- id={t.get("id")} name="{t.get("name")}" -> {to_name}')
     return "\n".join(lines)
 
 
@@ -540,6 +598,10 @@ async def getMyself() -> str:
     status, body = await _request("GET", "/rest/api/3/myself")
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
+    if not isinstance(body, dict) or "accountId" not in body:
+        raise ToolError(
+            f"Jira returned an unexpected /myself response (HTTP {status}): {body!r}"
+        )
 
     return (
         f"accountId: {body['accountId']}\n"
@@ -589,10 +651,10 @@ async def getVisibleJiraProjects(
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
 
-    projects = body.get("values", [])
+    projects = body.get("values", []) if isinstance(body, dict) else []
     lines = [f"Found {len(projects)} project(s):"]
     for p in projects:
-        lines.append(f"- **{p['key']}**: {p['name']}")
+        lines.append(f"- **{p.get('key', '?')}**: {p.get('name', '?')}")
     return "\n".join(lines)
 
 
@@ -617,6 +679,11 @@ async def getJiraIssueTypeMetaWithFields(
         )
         if not _is_ok(status):
             raise ToolError(_error_message(status, body))
+        if not isinstance(body, dict):
+            raise ToolError(
+                f"Jira returned an unexpected createmeta response (HTTP {status}): "
+                f"{body!r}"
+            )
 
         page = body.get("values", body.get("fields", []))
 
@@ -648,6 +715,13 @@ async def getJiraIssueTypeMetaWithFields(
         name = field.get("name", field_id)
         lines.append(f"- {field_id}: {name}{required}")
     return "\n".join(lines)
+
+
+# Upper bound on the reassembly buffer. A single JSON-RPC message should never
+# approach this; exceeding it means the stream is unparseable garbage rather
+# than a legitimately-large multiline message, so we resync instead of growing
+# (and re-parsing) an ever-larger buffer forever.
+_MAX_STDIN_BUFFER = 10 * 1024 * 1024
 
 
 class _JsonLineBufferedStdin:
@@ -696,11 +770,28 @@ class _JsonLineBufferedStdin:
                 # and the transport sees a single valid JSON line.
                 return json.dumps(parsed, ensure_ascii=False) + "\n"
 
-        # stdin exhausted
+            if len(self._buffer) > _MAX_STDIN_BUFFER:
+                print(
+                    f"jira-mcp: stdin buffer exceeded {_MAX_STDIN_BUFFER} bytes "
+                    "without forming valid JSON; discarding and resyncing",
+                    file=sys.stderr,
+                )
+                self._buffer = ""
+
+        # stdin exhausted. A leftover buffer that still does not parse is a
+        # truncated/garbled final message — discard it rather than handing the
+        # transport invalid JSON that would surface as an opaque parse error.
         if self._buffer:
-            remaining = self._buffer
-            self._buffer = ""
-            return remaining
+            remaining, self._buffer = self._buffer, ""
+            parsed = self._try_parse(remaining)
+            if parsed is None:
+                print(
+                    f"jira-mcp: discarding {len(remaining)} bytes of unparseable "
+                    "buffered stdin at EOF",
+                    file=sys.stderr,
+                )
+                raise StopAsyncIteration
+            return json.dumps(parsed, ensure_ascii=False) + "\n"
         raise StopAsyncIteration
 
 
@@ -713,11 +804,14 @@ async def _run_stdio():
         stdin=buffered,  # ty: ignore[invalid-argument-type]
     )
     async with streams as (read_stream, write_stream):
-        await mcp._mcp_server.run(
-            read_stream,
-            write_stream,
-            mcp._mcp_server.create_initialization_options(),
-        )
+        try:
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+        finally:
+            await _close_session()
 
 
 def main():

@@ -77,6 +77,41 @@ async def test_request_returns_text_for_non_json():
     assert body == "plain text"
 
 
+async def test_request_connection_error_raises_toolerror():
+    """Transport failures are surfaced as ToolError, not raw aiohttp errors."""
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/test",
+            exception=aiohttp.ClientConnectionError("boom"),
+        )
+        with pytest.raises(ToolError, match="Could not reach Jira"):
+            await main._request("GET", "/rest/api/3/test")
+
+
+async def test_request_timeout_raises_toolerror():
+    """A request timeout becomes a ToolError with actionable text."""
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/test",
+            exception=TimeoutError(),
+        )
+        with pytest.raises(ToolError, match="timed out"):
+            await main._request("GET", "/rest/api/3/test")
+
+
+async def test_request_unparseable_json_raises_toolerror():
+    """A JSON content-type with a non-JSON body is reported, not silently swallowed."""
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/test",
+            body="<html>502 Bad Gateway</html>",
+            content_type="application/json",
+            status=502,
+        )
+        with pytest.raises(ToolError, match="unparseable response"):
+            await main._request("GET", "/rest/api/3/test")
+
+
 # ---------------------------------------------------------------------------
 # _error_message
 # ---------------------------------------------------------------------------
@@ -104,6 +139,14 @@ def test_error_message_fallback_to_json():
     body = {"unexpected": "structure"}
     msg = main._error_message(400, body)
     assert json.dumps(body) in msg
+
+
+def test_error_message_with_list_body():
+    """A JSON-array error body must not crash the formatter."""
+    body = [{"some": "error"}]
+    msg = main._error_message(400, body)
+    assert json.dumps(body) in msg
+    assert "HTTP 400" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +218,23 @@ def test_markdown_to_adf_underscore_in_identifier():
     nodes = result["content"][0]["content"]
     assert len(nodes) == 1
     assert nodes[0]["text"] == "the release_publish_command option"
+
+
+def test_markdown_to_adf_literal_asterisks_not_italic():
+    """Whitespace-flanked asterisks (e.g. arithmetic) must stay literal text."""
+    result = main._markdown_to_adf("2 * 3 * 4")
+    nodes = result["content"][0]["content"]
+    assert len(nodes) == 1
+    assert nodes[0]["text"] == "2 * 3 * 4"
+    assert "marks" not in nodes[0]
+
+
+def test_markdown_to_adf_inline_italic_asterisk():
+    """Genuine *italic* (markers abutting non-space) still converts."""
+    result = main._markdown_to_adf("some *italic* text")
+    nodes = result["content"][0]["content"]
+    assert nodes[1]["text"] == "italic"
+    assert nodes[1]["marks"] == [{"type": "em"}]
 
 
 def test_markdown_to_adf_inline_code():
@@ -372,9 +432,48 @@ async def test_search_issues():
         )
         result = await main.searchJiraIssues(jql="project = TEST")
 
-    assert "Found 1 issue(s)" in result
+    assert "Showing 1 issue(s)" in result
     assert "TEST-1" in result
     assert "Unassigned" in result
+
+
+async def test_search_issues_reports_more_available(monkeypatch):
+    """Hitting maxResults with a nextPageToken left over flags more matches."""
+    monkeypatch.setattr(main, "_JIRA_PAGE_SIZE", 2)
+
+    search_url = stdlib_re.compile(
+        r"^https://openmrs\.atlassian\.net/rest/api/3/search/jql"
+    )
+    with aioresponses() as m:
+        m.get(
+            search_url,
+            payload={
+                "isLast": False,
+                "nextPageToken": "page-2",
+                "issues": [
+                    {
+                        "key": "TEST-1",
+                        "fields": {
+                            "summary": "One",
+                            "status": {"name": "Open"},
+                            "assignee": None,
+                        },
+                    },
+                    {
+                        "key": "TEST-2",
+                        "fields": {
+                            "summary": "Two",
+                            "status": {"name": "Open"},
+                            "assignee": None,
+                        },
+                    },
+                ],
+            },
+        )
+        result = await main.searchJiraIssues(jql="project = TEST", maxResults=2)
+
+    assert "Showing 2 issue(s)" in result
+    assert "more available" in result
 
 
 async def test_search_issues_paginates(monkeypatch):
@@ -414,7 +513,7 @@ async def test_search_issues_paginates(monkeypatch):
         )
         result = await main.searchJiraIssues(jql="project = TEST", maxResults=5)
 
-    assert "Found 3 issue(s) (showing 3)" in result
+    assert "Showing 3 issue(s)" in result
     assert "TEST-1" in result
     assert "TEST-2" in result
     assert "TEST-3" in result
@@ -623,6 +722,14 @@ async def test_buffered_stdin_multiple_messages():
     assert len(results) == 2
     assert json.loads(results[0])["method"] == "a"
     assert json.loads(results[1])["method"] == "b"
+
+
+async def test_buffered_stdin_discards_unparseable_at_eof():
+    """A garbled final message that never parses is discarded, not forwarded."""
+    fake = _FakeAsyncStdin(['{"jsonrpc": "2.0", "method": "trunc\n'])
+    buffered = _JsonLineBufferedStdin(fake)
+    results = await _collect(buffered)
+    assert results == []
 
 
 async def test_buffered_stdin_mixed_good_and_broken():
