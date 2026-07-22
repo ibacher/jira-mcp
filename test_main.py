@@ -372,6 +372,200 @@ async def test_create_issue_api_error():
             )
 
 
+async def test_create_issue_with_parent():
+    with aioresponses() as m:
+        m.post(f"{JIRA_BASE}/rest/api/3/issue", payload={"key": "TEST-3"})
+        await main.createJiraIssue(
+            projectKey="TEST",
+            summary="Child of an Epic",
+            issueType="Task",
+            parentKey="TEST-1",
+        )
+
+    assert m.requests is not None
+    call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue"))][0]
+    assert call.kwargs["json"]["fields"]["parent"] == {"key": "TEST-1"}
+
+
+async def test_create_issue_with_outward_link():
+    with aioresponses() as m:
+        m.post(f"{JIRA_BASE}/rest/api/3/issue", payload={"key": "TEST-5"})
+        m.post(f"{JIRA_BASE}/rest/api/3/issueLink", status=201)
+        result = await main.createJiraIssue(
+            projectKey="TEST",
+            summary="Blocker",
+            issueType="Bug",
+            links=[main.IssueLink(type="Blocks", issueKey="TEST-9")],
+        )
+
+    assert "Created TEST-5" in result
+    assert "Linked TEST-5" in result
+
+    assert m.requests is not None
+    link_call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issueLink"))][0]
+    payload = link_call.kwargs["json"]
+    assert payload["type"] == {"name": "Blocks"}
+    # Default direction "outward": the new issue blocks the other one.
+    assert payload["outwardIssue"] == {"key": "TEST-5"}
+    assert payload["inwardIssue"] == {"key": "TEST-9"}
+
+
+async def test_create_issue_with_inward_link():
+    with aioresponses() as m:
+        m.post(f"{JIRA_BASE}/rest/api/3/issue", payload={"key": "TEST-7"})
+        m.post(f"{JIRA_BASE}/rest/api/3/issueLink", status=201)
+        await main.createJiraIssue(
+            projectKey="TEST",
+            summary="Blocked",
+            issueType="Bug",
+            links=[
+                main.IssueLink(type="Blocks", issueKey="TEST-9", direction="inward")
+            ],
+        )
+
+    assert m.requests is not None
+    link_call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issueLink"))][0]
+    payload = link_call.kwargs["json"]
+    # Direction "inward": the new issue is blocked by the other one.
+    assert payload["inwardIssue"] == {"key": "TEST-7"}
+    assert payload["outwardIssue"] == {"key": "TEST-9"}
+
+
+async def test_create_issue_reports_link_failure():
+    """A link that fails after the issue is created is reported, not raised."""
+    with aioresponses() as m:
+        m.post(f"{JIRA_BASE}/rest/api/3/issue", payload={"key": "TEST-8"})
+        m.post(
+            f"{JIRA_BASE}/rest/api/3/issueLink",
+            payload={"errorMessages": ["No issue link type with name 'Nope' found"]},
+            status=404,
+        )
+        result = await main.createJiraIssue(
+            projectKey="TEST",
+            summary="s",
+            issueType="Bug",
+            links=[main.IssueLink(type="Nope", issueKey="TEST-9")],
+        )
+
+    assert "Created TEST-8" in result
+    assert "FAILED to link" in result
+    assert "No issue link type" in result
+
+
+# ---------------------------------------------------------------------------
+# editJiraIssue
+# ---------------------------------------------------------------------------
+
+
+async def test_edit_issue_fields():
+    with aioresponses() as m:
+        m.put(f"{JIRA_BASE}/rest/api/3/issue/TEST-1", status=204)
+        result = await main.editJiraIssue("TEST-1", summary="New title")
+
+    assert "Updated TEST-1" in result
+    assert m.requests is not None
+    call = m.requests[("PUT", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue/TEST-1"))][0]
+    assert call.kwargs["json"]["fields"]["summary"] == "New title"
+
+
+async def test_edit_issue_sets_parent():
+    with aioresponses() as m:
+        m.put(f"{JIRA_BASE}/rest/api/3/issue/TEST-1", status=204)
+        await main.editJiraIssue("TEST-1", parentKey="TEST-100")
+
+    assert m.requests is not None
+    call = m.requests[("PUT", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue/TEST-1"))][0]
+    assert call.kwargs["json"]["fields"]["parent"] == {"key": "TEST-100"}
+
+
+async def test_edit_issue_clears_parent():
+    """An empty parentKey clears the existing parent (sets the field to null)."""
+    with aioresponses() as m:
+        m.put(f"{JIRA_BASE}/rest/api/3/issue/TEST-1", status=204)
+        await main.editJiraIssue("TEST-1", parentKey="")
+
+    assert m.requests is not None
+    call = m.requests[("PUT", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue/TEST-1"))][0]
+    assert call.kwargs["json"]["fields"]["parent"] is None
+
+
+async def test_edit_issue_links_only_skips_put():
+    """Editing only links makes no field-update PUT."""
+    with aioresponses() as m:
+        m.post(f"{JIRA_BASE}/rest/api/3/issueLink", status=201)
+        result = await main.editJiraIssue(
+            "TEST-1", links=[main.IssueLink(type="Relates", issueKey="TEST-2")]
+        )
+
+    assert "Linked TEST-1" in result
+    assert m.requests is not None
+    assert (
+        "PUT",
+        yarl.URL(f"{JIRA_BASE}/rest/api/3/issue/TEST-1"),
+    ) not in m.requests
+
+
+async def test_edit_issue_no_changes():
+    result = await main.editJiraIssue("TEST-1")
+    assert result == "No fields or links provided to update."
+
+
+# ---------------------------------------------------------------------------
+# linkJiraIssues / getJiraIssueLinkTypes
+# ---------------------------------------------------------------------------
+
+
+async def test_link_jira_issues():
+    with aioresponses() as m:
+        m.post(f"{JIRA_BASE}/rest/api/3/issueLink", status=201)
+        result = await main.linkJiraIssues(
+            linkType="Blocks", inwardIssue="TEST-2", outwardIssue="TEST-1"
+        )
+
+    assert "TEST-1 -> TEST-2" in result
+    assert m.requests is not None
+    call = m.requests[("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issueLink"))][0]
+    payload = call.kwargs["json"]
+    assert payload["type"] == {"name": "Blocks"}
+    assert payload["inwardIssue"] == {"key": "TEST-2"}
+    assert payload["outwardIssue"] == {"key": "TEST-1"}
+
+
+async def test_link_jira_issues_error():
+    with aioresponses() as m:
+        m.post(
+            f"{JIRA_BASE}/rest/api/3/issueLink",
+            payload={"errorMessages": ["Issue does not exist"]},
+            status=404,
+        )
+        with pytest.raises(ToolError, match="Issue does not exist"):
+            await main.linkJiraIssues(
+                linkType="Blocks", inwardIssue="TEST-2", outwardIssue="TEST-1"
+            )
+
+
+async def test_get_issue_link_types():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/issueLinkType",
+            payload={
+                "issueLinkTypes": [
+                    {
+                        "id": "1",
+                        "name": "Blocks",
+                        "inward": "is blocked by",
+                        "outward": "blocks",
+                    }
+                ]
+            },
+        )
+        result = await main.getJiraIssueLinkTypes()
+
+    assert "Blocks" in result
+    assert 'outward="blocks"' in result
+    assert 'inward="is blocked by"' in result
+
+
 # ---------------------------------------------------------------------------
 # getJiraIssue
 # ---------------------------------------------------------------------------
@@ -403,6 +597,62 @@ async def test_get_issue():
     assert "High" in result
     assert "Alice" in result
     assert "backend" in result
+
+
+async def test_get_issue_with_parent_and_links():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/issue/TEST-1",
+            payload={
+                "key": "TEST-1",
+                "fields": {
+                    "summary": "Test issue",
+                    "status": {"name": "Open"},
+                    "parent": {
+                        "key": "TEST-100",
+                        "fields": {"summary": "The Epic"},
+                    },
+                    "issuelinks": [
+                        {
+                            "type": {
+                                "name": "Blocks",
+                                "inward": "is blocked by",
+                                "outward": "blocks",
+                            },
+                            # This issue is the inward side (blocked by TEST-9).
+                            "outwardIssue": {
+                                "key": "TEST-9",
+                                "fields": {
+                                    "summary": "Blocker issue",
+                                    "status": {"name": "In Progress"},
+                                },
+                            },
+                        },
+                        {
+                            "type": {
+                                "name": "Blocks",
+                                "inward": "is blocked by",
+                                "outward": "blocks",
+                            },
+                            # This issue is the outward side (blocks TEST-5).
+                            "inwardIssue": {
+                                "key": "TEST-5",
+                                "fields": {
+                                    "summary": "Blocked issue",
+                                    "status": {"name": "Open"},
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        result = await main.getJiraIssue("TEST-1")
+
+    assert "Parent: TEST-100 The Epic" in result
+    assert "Links:" in result
+    assert "- is blocked by TEST-9 [In Progress] Blocker issue" in result
+    assert "- blocks TEST-5 [Open] Blocked issue" in result
 
 
 # ---------------------------------------------------------------------------

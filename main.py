@@ -4,14 +4,14 @@ import re
 import sys
 from base64 import b64encode
 from io import TextIOWrapper
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import aiohttp
 import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 mcp = FastMCP("jira-mcp")
 
@@ -313,6 +313,141 @@ def _adf_to_plain_text(node: dict | list | str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Issue links
+# ---------------------------------------------------------------------------
+
+
+class IssueLink(BaseModel):
+    """A link to create between the issue being created/edited and another one.
+
+    Direction is expressed relative to *this* issue (the one being
+    created/edited).  For an asymmetric type like "Blocks" (outward="blocks",
+    inward="is blocked by"):
+
+    - ``direction="outward"`` (default): this issue **blocks** ``issueKey``.
+    - ``direction="inward"``: this issue **is blocked by** ``issueKey``.
+
+    For symmetric types like "Relates", direction has no visible effect.
+    """
+
+    type: Annotated[
+        str,
+        Field(
+            description='Link type name, e.g. "Blocks", "Relates", "Duplicate", '
+            '"Clones". Use getJiraIssueLinkTypes to list valid names.'
+        ),
+    ]
+    issueKey: Annotated[
+        str,
+        Field(description='The other issue to link to, e.g. "OCLOMRS-123"'),
+    ]
+    direction: Annotated[
+        Literal["inward", "outward"],
+        Field(
+            description='Side of the link this issue occupies. "outward" (default) '
+            'means this issue is the source (e.g. it "blocks" issueKey); "inward" '
+            'means this issue is the target (e.g. it "is blocked by" issueKey).'
+        ),
+    ] = "outward"
+
+
+async def _create_issue_link(
+    link_type: str, inward_key: str, outward_key: str
+) -> tuple[int, Any]:
+    """POST a single issue link. The outward issue is the source of the
+    relationship (e.g. for "Blocks", outward_key blocks inward_key)."""
+    return await _request(
+        "POST",
+        "/rest/api/3/issueLink",
+        json={
+            "type": {"name": link_type},
+            "inwardIssue": {"key": inward_key},
+            "outwardIssue": {"key": outward_key},
+        },
+    )
+
+
+async def _apply_issue_links(this_key: str, links: list[IssueLink]) -> list[str]:
+    """Create each requested link relative to ``this_key``.
+
+    Links are applied one at a time via separate API calls, so some may
+    succeed while others fail. Returns a human-readable result line per link
+    (prefixed with FAILED on error) rather than raising, so the caller can
+    report partial success alongside the issue that was created/edited.
+    """
+    results: list[str] = []
+    for link in links:
+        if link.direction == "outward":
+            inward_key, outward_key = link.issueKey, this_key
+        else:
+            inward_key, outward_key = this_key, link.issueKey
+
+        status, body = await _create_issue_link(link.type, inward_key, outward_key)
+        if _is_ok(status):
+            results.append(
+                f"Linked {this_key} ({link.direction}) to {link.issueKey} "
+                f'via "{link.type}"'
+            )
+        else:
+            results.append(
+                f'FAILED to link {this_key} to {link.issueKey} via "{link.type}": '
+                f"{_error_message(status, body)}"
+            )
+    return results
+
+
+def _format_parent(parent: Any) -> str | None:
+    """Format the ``parent`` field of an issue (its Epic or parent issue)."""
+    if not isinstance(parent, dict):
+        return None
+    p_key = parent.get("key", "?")
+    p_summary = (parent.get("fields") or {}).get("summary", "")
+    return f"Parent: {p_key} {p_summary}".rstrip()
+
+
+def _format_issue_links(links: Any) -> str | None:
+    """Format the ``issuelinks`` field into a readable "Links:" block.
+
+    Jira returns the *other* issue under either ``outwardIssue`` (this issue is
+    the inward side of the link) or ``inwardIssue`` (this issue is the outward
+    side). The relationship is described from this issue's perspective, so we
+    use the type's inward description in the former case and its outward
+    description in the latter.
+    """
+    if not isinstance(links, list):
+        return None
+
+    link_lines: list[str] = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        link_type = link.get("type") or {}
+        other = link.get("outwardIssue")
+        if isinstance(other, dict):
+            relation = link_type.get("inward", "is linked to")
+        else:
+            other = link.get("inwardIssue")
+            relation = link_type.get("outward", "is linked to")
+        if not isinstance(other, dict):
+            continue
+
+        o_key = other.get("key", "?")
+        o_fields = other.get("fields") or {}
+        o_status = o_fields.get("status")
+        status_suffix = (
+            f" [{o_status['name']}]"
+            if isinstance(o_status, dict) and o_status.get("name")
+            else ""
+        )
+        summary = o_fields.get("summary", "")
+        link_lines.append(f"- {relation} {o_key}{status_suffix} {summary}".rstrip())
+
+    if not link_lines:
+        return None
+    return "Links:\n" + "\n".join(link_lines)
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -334,6 +469,21 @@ async def createJiraIssue(
     assigneeAccountId: Annotated[
         str | None, Field(description="Jira account ID for the assignee")
     ] = None,
+    parentKey: Annotated[
+        str | None,
+        Field(
+            description='Parent issue key (e.g. "OCLOMRS-100"). Set this to place '
+            "the issue under an Epic, or to make it a subtask of another issue."
+        ),
+    ] = None,
+    links: Annotated[
+        list[IssueLink] | None,
+        Field(
+            description="Issue links to create after the issue is created. Each is "
+            "applied via a separate API call, so a link may fail even if the issue "
+            "is created successfully; failures are reported in the result."
+        ),
+    ] = None,
 ) -> str:
     """Create a new Jira issue."""
     fields: dict = {
@@ -349,6 +499,8 @@ async def createJiraIssue(
         fields["labels"] = labels
     if assigneeAccountId:
         fields["assignee"] = {"accountId": assigneeAccountId}
+    if parentKey:
+        fields["parent"] = {"key": parentKey}
 
     status, body = await _request("POST", "/rest/api/3/issue", json={"fields": fields})
     if not _is_ok(status):
@@ -360,7 +512,11 @@ async def createJiraIssue(
             f"Jira accepted the request (HTTP {status}) but returned no issue key: "
             f"{body!r}"
         )
-    return f"Created {key}: {JIRA_BASE_URL}/browse/{key}"
+
+    result_lines = [f"Created {key}: {JIRA_BASE_URL}/browse/{key}"]
+    if links:
+        result_lines.extend(await _apply_issue_links(key, links))
+    return "\n".join(result_lines)
 
 
 @mcp.tool()
@@ -398,10 +554,15 @@ async def getJiraIssue(
         f"Priority: {f['priority']['name']}" if f.get("priority") else None,
         f"Assignee: {f['assignee']['displayName']}" if f.get("assignee") else None,
         f"Labels: {', '.join(f['labels'])}" if f.get("labels") else None,
+        _format_parent(f.get("parent")),
     ]
     desc = f.get("description")
     if desc:
         lines.append(f"Description:\n{_adf_to_plain_text(desc)}")
+
+    link_summary = _format_issue_links(f.get("issuelinks"))
+    if link_summary:
+        lines.append(link_summary)
 
     return "\n".join(line for line in lines if line is not None)
 
@@ -427,6 +588,22 @@ async def editJiraIssue(
     issueType: Annotated[
         str | None, Field(description='Issue type, e.g. "Bug", "Task", "Story"')
     ] = None,
+    parentKey: Annotated[
+        str | None,
+        Field(
+            description='Parent issue key (e.g. "OCLOMRS-100") to place this issue '
+            "under an Epic or make it a subtask. Use an empty string to remove the "
+            "existing parent."
+        ),
+    ] = None,
+    links: Annotated[
+        list[IssueLink] | None,
+        Field(
+            description="Issue links to create. Each is applied via a separate API "
+            "call after any field updates, so a link may fail independently; "
+            "failures are reported in the result."
+        ),
+    ] = None,
 ) -> str:
     """Edit fields on an existing Jira issue."""
     fields: dict = {}
@@ -442,17 +619,28 @@ async def editJiraIssue(
         fields["assignee"] = {"accountId": assigneeAccountId}
     if issueType is not None:
         fields["issuetype"] = {"name": issueType}
+    if parentKey is not None:
+        # An empty string clears the parent; a key sets/changes it.
+        fields["parent"] = {"key": parentKey} if parentKey else None
 
-    if not fields:
-        return "No fields provided to update."
+    if not fields and not links:
+        return "No fields or links provided to update."
 
-    status, body = await _request(
-        "PUT", f"/rest/api/3/issue/{issueIdOrKey}", json={"fields": fields}
-    )
-    if not _is_ok(status):
-        raise ToolError(_error_message(status, body))
+    result_lines: list[str] = []
+    if fields:
+        status, body = await _request(
+            "PUT", f"/rest/api/3/issue/{issueIdOrKey}", json={"fields": fields}
+        )
+        if not _is_ok(status):
+            raise ToolError(_error_message(status, body))
+        result_lines.append(
+            f"Updated {issueIdOrKey}: {JIRA_BASE_URL}/browse/{issueIdOrKey}"
+        )
 
-    return f"Updated {issueIdOrKey}: {JIRA_BASE_URL}/browse/{issueIdOrKey}"
+    if links:
+        result_lines.extend(await _apply_issue_links(issueIdOrKey, links))
+
+    return "\n".join(result_lines)
 
 
 _JIRA_PAGE_SIZE = 50
@@ -544,6 +732,68 @@ async def addCommentToJiraIssue(
         resp_body.get("id", "(unknown)") if isinstance(resp_body, dict) else "(unknown)"
     )
     return f"Comment added (id: {comment_id}) to {issueIdOrKey}"
+
+
+@mcp.tool()
+async def getJiraIssueLinkTypes() -> str:
+    """List the issue link types available in this Jira site.
+
+    Each type has an outward and an inward description. When creating a link,
+    the outward issue is the source of the relationship: for "Blocks"
+    (outward="blocks", inward="is blocked by"), the outward issue blocks the
+    inward issue.
+    """
+    status, body = await _request("GET", "/rest/api/3/issueLinkType")
+    if not _is_ok(status):
+        raise ToolError(_error_message(status, body))
+
+    types = body.get("issueLinkTypes", []) if isinstance(body, dict) else []
+    if not types:
+        return "No issue link types are configured for this Jira site."
+
+    lines = ["Available issue link types:"]
+    for t in types:
+        name = t.get("name", "?")
+        outward = t.get("outward", "?")
+        inward = t.get("inward", "?")
+        lines.append(f'- **{name}**: outward="{outward}", inward="{inward}"')
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def linkJiraIssues(
+    linkType: Annotated[
+        str,
+        Field(
+            description='Link type name, e.g. "Blocks", "Relates", "Duplicate", '
+            '"Clones". Use getJiraIssueLinkTypes to list valid names.'
+        ),
+    ],
+    inwardIssue: Annotated[
+        str,
+        Field(
+            description='Key of the inward (target) issue. For "Blocks", this is the '
+            'issue that "is blocked by" the outward issue, e.g. "OCLOMRS-123".'
+        ),
+    ],
+    outwardIssue: Annotated[
+        str,
+        Field(
+            description='Key of the outward (source) issue. For "Blocks", this is the '
+            'issue that "blocks" the inward issue, e.g. "OCLOMRS-456".'
+        ),
+    ],
+) -> str:
+    """Create a link between two existing Jira issues.
+
+    The outward issue is the source of the relationship: for type "Blocks",
+    outwardIssue blocks inwardIssue (inwardIssue is blocked by outwardIssue).
+    """
+    status, body = await _create_issue_link(linkType, inwardIssue, outwardIssue)
+    if not _is_ok(status):
+        raise ToolError(_error_message(status, body))
+
+    return f'Linked {outwardIssue} -> {inwardIssue} via "{linkType}"'
 
 
 @mcp.tool()
