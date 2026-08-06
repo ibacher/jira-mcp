@@ -734,6 +734,137 @@ async def addCommentToJiraIssue(
     return f"Comment added (id: {comment_id}) to {issueIdOrKey}"
 
 
+def _format_comment(comment: Any) -> str:
+    """Format one comment from the /comment endpoint into a readable block."""
+    if not isinstance(comment, dict):
+        return "- (unexpected comment shape)"
+    author = comment.get("author") or {}
+    author_name = author.get("displayName", "(unknown)")
+    created = comment.get("created", "?")
+    header = f"- **id {comment.get('id', '?')}** by {author_name} on {created}"
+    updated = comment.get("updated")
+    if updated and updated != comment.get("created"):
+        editor = (comment.get("updateAuthor") or {}).get("displayName", author_name)
+        header += f" (edited by {editor} on {updated})"
+    text = _adf_to_plain_text(comment.get("body")).strip()
+    return f"{header}\n{text}" if text else header
+
+
+@mcp.tool()
+async def getJiraIssueComments(
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+    maxResults: Annotated[
+        int, Field(description="Max comments to return (paginates automatically)")
+    ] = 25,
+    newestFirst: Annotated[
+        bool,
+        Field(
+            description="Return the most recent comments first. Keep this true when "
+            "you only want recent activity, since truncation drops the comments "
+            "beyond maxResults; set it false to read a discussion in order."
+        ),
+    ] = True,
+) -> str:
+    """List the comments on a Jira issue, with the comment IDs needed to edit them."""
+    comments: list[dict] = []
+    total: int | None = None
+
+    while len(comments) < maxResults:
+        page_size = min(_JIRA_PAGE_SIZE, maxResults - len(comments))
+        status, body = await _request(
+            "GET",
+            f"/rest/api/3/issue/{issueIdOrKey}/comment",
+            params={
+                "startAt": len(comments),
+                "maxResults": page_size,
+                "orderBy": "-created" if newestFirst else "created",
+            },
+        )
+        if not _is_ok(status):
+            raise ToolError(_error_message(status, body))
+        if not isinstance(body, dict):
+            raise ToolError(
+                f"Jira returned an unexpected comment response (HTTP {status}): "
+                f"{body!r}"
+            )
+
+        page = body.get("comments", [])
+        if not isinstance(page, list) or not page:
+            break
+        comments.extend(page)
+        total = body.get("total") if isinstance(body.get("total"), int) else total
+        if total is not None and len(comments) >= total:
+            break
+
+    if not comments:
+        return f"{issueIdOrKey} has no comments."
+
+    header = f"Showing {len(comments)} comment(s)"
+    if total is not None and total > len(comments):
+        header += f" of {total} (increase maxResults for more)"
+    header += f" on {issueIdOrKey}"
+    if newestFirst:
+        header += ", newest first"
+    return "\n".join([f"{header}:", *(_format_comment(c) for c in comments)])
+
+
+@mcp.tool()
+async def editJiraIssueComment(
+    issueIdOrKey: Annotated[
+        str, Field(description='Issue key (e.g. "OCLOMRS-123") or numeric ID')
+    ],
+    commentId: Annotated[
+        str,
+        Field(
+            description="Numeric ID of the comment to edit. Use "
+            "getJiraIssueComments to find it."
+        ),
+    ],
+    body: Annotated[
+        str,
+        Field(
+            description="Replacement comment text in Markdown (converted to ADF). "
+            "This replaces the whole comment; it is not appended."
+        ),
+    ],
+) -> str:
+    """Replace the text of a comment you posted on a Jira issue.
+
+    Only the authenticated user's own comments can be edited: the comment's
+    author is checked against /myself first, so an agent cannot rewrite someone
+    else's words even if the Jira account holds "Edit All Comments" permission.
+    """
+    path = f"/rest/api/3/issue/{issueIdOrKey}/comment/{commentId}"
+    status, existing = await _request("GET", path)
+    if not _is_ok(status):
+        raise ToolError(_error_message(status, existing))
+    if not isinstance(existing, dict):
+        raise ToolError(
+            f"Jira returned an unexpected comment response (HTTP {status}): "
+            f"{existing!r}"
+        )
+
+    author_id = (existing.get("author") or {}).get("accountId")
+    me = await _fetch_myself()
+    if not author_id or author_id != me["accountId"]:
+        author_name = (existing.get("author") or {}).get("displayName", "another user")
+        raise ToolError(
+            f"Refusing to edit comment {commentId} on {issueIdOrKey}: it was posted "
+            f"by {author_name}, not the authenticated user "
+            f"({me.get('displayName', me['accountId'])}). Add a new comment instead."
+        )
+
+    status, resp_body = await _request(
+        "PUT", path, json={"body": _markdown_to_adf(body)}
+    )
+    if not _is_ok(status):
+        raise ToolError(_error_message(status, resp_body))
+
+    return f"Comment {commentId} on {issueIdOrKey} updated"
+
+
 @mcp.tool()
 async def getJiraIssueLinkTypes() -> str:
     """List the issue link types available in this Jira site.
@@ -842,16 +973,24 @@ async def transitionJiraIssue(
     return f"Transitioned {issueIdOrKey} (transition id {transitionId})"
 
 
-@mcp.tool()
-async def getMyself() -> str:
-    """Get the currently authenticated Jira user's account ID and display name."""
+async def _fetch_myself() -> dict:
+    """Return the authenticated user's /myself record, guaranteed to have an
+    ``accountId``. Used both for reporting the identity and for ownership
+    checks (e.g. before editing a comment)."""
     status, body = await _request("GET", "/rest/api/3/myself")
     if not _is_ok(status):
         raise ToolError(_error_message(status, body))
-    if not isinstance(body, dict) or "accountId" not in body:
+    if not isinstance(body, dict) or not body.get("accountId"):
         raise ToolError(
             f"Jira returned an unexpected /myself response (HTTP {status}): {body!r}"
         )
+    return body
+
+
+@mcp.tool()
+async def getMyself() -> str:
+    """Get the currently authenticated Jira user's account ID and display name."""
+    body = await _fetch_myself()
 
     return (
         f"accountId: {body['accountId']}\n"

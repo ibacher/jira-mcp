@@ -827,6 +827,198 @@ async def test_issue_type_meta_paginates_fields(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# comments
+# ---------------------------------------------------------------------------
+
+_COMMENTS_URL = stdlib_re.compile(
+    r"^https://openmrs\.atlassian\.net/rest/api/3/issue/TEST-1/comment(\?|$)"
+)
+
+
+def _make_comment(comment_id: str, *, account_id: str = "me123", **overrides) -> dict:
+    comment = {
+        "id": comment_id,
+        "author": {"accountId": account_id, "displayName": "Alice"},
+        "created": "2026-01-01T10:00:00.000+0000",
+        "updated": "2026-01-01T10:00:00.000+0000",
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": f"Comment {comment_id}"}],
+                }
+            ],
+        },
+    }
+    comment.update(overrides)
+    return comment
+
+
+async def test_add_comment():
+    with aioresponses() as m:
+        m.post(
+            f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment",
+            payload={"id": "10001"},
+            status=201,
+        )
+        result = await main.addCommentToJiraIssue("TEST-1", "Hello **world**")
+
+    assert "Comment added (id: 10001) to TEST-1" in result
+    assert m.requests is not None
+    call = m.requests[
+        ("POST", yarl.URL(f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment"))
+    ][0]
+    assert call.kwargs["json"]["body"]["type"] == "doc"
+
+
+async def test_get_issue_comments():
+    with aioresponses() as m:
+        m.get(
+            _COMMENTS_URL,
+            payload={"total": 1, "comments": [_make_comment("10001")]},
+        )
+        result = await main.getJiraIssueComments("TEST-1")
+
+    assert "Showing 1 comment(s) on TEST-1, newest first:" in result
+    assert "- **id 10001** by Alice on 2026-01-01T10:00:00.000+0000" in result
+    assert "Comment 10001" in result
+    assert m.requests is not None
+    call = next(call for calls in m.requests.values() for call in calls)
+    assert call.kwargs["params"]["orderBy"] == "-created"
+
+
+async def test_get_issue_comments_oldest_first():
+    with aioresponses() as m:
+        m.get(_COMMENTS_URL, payload={"total": 1, "comments": [_make_comment("10001")]})
+        result = await main.getJiraIssueComments("TEST-1", newestFirst=False)
+
+    assert "newest first" not in result
+    assert m.requests is not None
+    call = next(call for calls in m.requests.values() for call in calls)
+    assert call.kwargs["params"]["orderBy"] == "created"
+
+
+async def test_get_issue_comments_marks_edited():
+    edited = _make_comment(
+        "10001",
+        updated="2026-01-02T09:00:00.000+0000",
+        updateAuthor={"accountId": "me123", "displayName": "Alice"},
+    )
+    with aioresponses() as m:
+        m.get(_COMMENTS_URL, payload={"total": 1, "comments": [edited]})
+        result = await main.getJiraIssueComments("TEST-1")
+
+    assert "(edited by Alice on 2026-01-02T09:00:00.000+0000)" in result
+
+
+async def test_get_issue_comments_paginates(monkeypatch):
+    monkeypatch.setattr(main, "_JIRA_PAGE_SIZE", 1)
+    with aioresponses() as m:
+        m.get(_COMMENTS_URL, payload={"total": 2, "comments": [_make_comment("1")]})
+        m.get(_COMMENTS_URL, payload={"total": 2, "comments": [_make_comment("2")]})
+        result = await main.getJiraIssueComments("TEST-1", maxResults=5)
+
+    assert "Showing 2 comment(s)" in result
+    assert m.requests is not None
+    calls = [call for calls in m.requests.values() for call in calls]
+    assert [c.kwargs["params"]["startAt"] for c in calls] == [0, 1]
+
+
+async def test_get_issue_comments_reports_truncation():
+    with aioresponses() as m:
+        m.get(_COMMENTS_URL, payload={"total": 10, "comments": [_make_comment("1")]})
+        result = await main.getJiraIssueComments("TEST-1", maxResults=1)
+
+    assert "Showing 1 comment(s) of 10 (increase maxResults for more)" in result
+
+
+async def test_get_issue_comments_empty():
+    with aioresponses() as m:
+        m.get(_COMMENTS_URL, payload={"total": 0, "comments": []})
+        result = await main.getJiraIssueComments("TEST-1")
+
+    assert result == "TEST-1 has no comments."
+
+
+async def test_get_issue_comments_api_error():
+    with aioresponses() as m:
+        m.get(
+            _COMMENTS_URL,
+            payload={"errorMessages": ["Issue does not exist"]},
+            status=404,
+        )
+        with pytest.raises(ToolError, match="Issue does not exist"):
+            await main.getJiraIssueComments("TEST-1")
+
+
+async def test_edit_comment_own_comment():
+    comment_url = f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment/10001"
+    with aioresponses() as m:
+        m.get(comment_url, payload=_make_comment("10001", account_id="me123"))
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/myself",
+            payload={"accountId": "me123", "displayName": "Alice"},
+        )
+        m.put(comment_url, payload=_make_comment("10001"))
+        result = await main.editJiraIssueComment("TEST-1", "10001", "Revised text")
+
+    assert result == "Comment 10001 on TEST-1 updated"
+    assert m.requests is not None
+    call = m.requests[("PUT", yarl.URL(comment_url))][0]
+    assert call.kwargs["json"]["body"]["content"][0]["content"][0]["text"] == (
+        "Revised text"
+    )
+
+
+async def test_edit_comment_refuses_someone_elses():
+    comment_url = f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment/10001"
+    with aioresponses() as m:
+        m.get(comment_url, payload=_make_comment("10001", account_id="bob456"))
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/myself",
+            payload={"accountId": "me123", "displayName": "Me"},
+        )
+        with pytest.raises(ToolError, match="it was posted by Alice"):
+            await main.editJiraIssueComment("TEST-1", "10001", "Revised text")
+
+    assert m.requests is not None
+    assert ("PUT", yarl.URL(comment_url)) not in m.requests
+
+
+async def test_edit_comment_refuses_unknown_author():
+    """A comment with no resolvable author cannot be proven to be ours."""
+    comment_url = f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment/10001"
+    with aioresponses() as m:
+        m.get(comment_url, payload={"id": "10001", "body": None})
+        m.get(f"{JIRA_BASE}/rest/api/3/myself", payload={"accountId": "me123"})
+        with pytest.raises(ToolError, match="Refusing to edit comment 10001"):
+            await main.editJiraIssueComment("TEST-1", "10001", "Revised text")
+
+
+async def test_edit_comment_missing_comment():
+    with aioresponses() as m:
+        m.get(
+            f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment/10001",
+            payload={"errorMessages": ["Comment does not exist"]},
+            status=404,
+        )
+        with pytest.raises(ToolError, match="Comment does not exist"):
+            await main.editJiraIssueComment("TEST-1", "10001", "Revised text")
+
+
+async def test_edit_comment_put_error():
+    comment_url = f"{JIRA_BASE}/rest/api/3/issue/TEST-1/comment/10001"
+    with aioresponses() as m:
+        m.get(comment_url, payload=_make_comment("10001"))
+        m.get(f"{JIRA_BASE}/rest/api/3/myself", payload={"accountId": "me123"})
+        m.put(comment_url, payload={"errorMessages": ["Edit failed"]}, status=400)
+        with pytest.raises(ToolError, match="Edit failed"):
+            await main.editJiraIssueComment("TEST-1", "10001", "Revised text")
+
+
+# ---------------------------------------------------------------------------
 # lookupJiraAccountId
 # ---------------------------------------------------------------------------
 

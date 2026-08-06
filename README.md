@@ -89,6 +89,8 @@ In your Claude Code settings (e.g. `~/.claude/settings.json`), add:
 | `editJiraIssue` | Update fields on an issue | `issueIdOrKey`, `summary`, `description`, `priority`, `labels`, `assigneeAccountId`, `issueType` |
 | `searchJiraIssues` | Search with JQL | `jql`, `maxResults`, `fields` |
 | `addCommentToJiraIssue` | Add a comment | `issueIdOrKey`, `body` |
+| `getJiraIssueComments` | List comments (with their IDs) | `issueIdOrKey`, `maxResults`, `newestFirst` |
+| `editJiraIssueComment` | Replace the text of your own comment | `issueIdOrKey`, `commentId`, `body` |
 | `getTransitionsForJiraIssue` | List available transitions | `issueIdOrKey` |
 | `transitionJiraIssue` | Move issue to new status | `issueIdOrKey`, `transitionId` |
 | `getVisibleJiraProjects` | List visible projects | `maxResults` |
@@ -96,3 +98,5 @@ In your Claude Code settings (e.g. `~/.claude/settings.json`), add:
 | `lookupJiraAccountId` | Search users by name/email | `query`, `maxResults` |
 
 All `description` and comment `body` parameters accept Markdown, which is automatically converted to Atlassian Document Format (ADF) before sending.
+
+`editJiraIssueComment` only edits comments posted by the authenticated user: the comment's author is compared against `/myself` and the edit is refused otherwise, even if the account holds Jira's "Edit All Comments" permission.
